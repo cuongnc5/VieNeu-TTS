@@ -77,6 +77,90 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
    Truy cập giao diện tại `http://127.0.0.1:7860`.
 
+### FFmpeg cho tab `VTT Dubbing`
+Tính năng `VTT Dubbing` dùng FFmpeg để tăng/giảm tốc độ từng speaker và ghép toàn bộ cue lên đúng timeline subtitle.
+
+1. **Cài FFmpeg**
+   - **Windows:** tải bản build từ trang chính thức hoặc `gyan.dev`, sau đó thêm thư mục chứa `ffmpeg.exe` vào `PATH`.
+   - **Ubuntu/Debian:** `sudo apt install ffmpeg`
+   - **Arch Linux:** `sudo pacman -S ffmpeg`
+   - **macOS (Homebrew):** `brew install ffmpeg`
+
+2. **Kiểm tra FFmpeg**
+   ```bash
+   ffmpeg -version
+   ```
+
+3. **Nếu FFmpeg không nằm trong `PATH`**
+   Thiết lập biến môi trường `FFMPEG_PATH` trỏ tới file thực thi:
+   ```bash
+   # Linux/macOS
+   export FFMPEG_PATH=/duong-dan/toi/ffmpeg
+
+   # Windows PowerShell
+   $env:FFMPEG_PATH="C:\ffmpeg\bin\ffmpeg.exe"
+   ```
+
+### Sử dụng tab `VTT Dubbing`
+Sau khi mở Web UI và tải model, chọn tab `VTT Dubbing` để tạo một file audio duy nhất từ subtitle `.vtt`.
+
+1. **Upload file `.vtt`**
+   - Hỗ trợ các định dạng speaker:
+     - `Speaker: Xin chào`
+     - `[Speaker] Xin chào`
+     - `<v Speaker>Xin chào</v>`
+   - Nếu cue không có speaker, hệ thống sẽ gán `Unknown`.
+
+2. **Nhấn `Detect Speakers`**
+   - Hệ thống sẽ parse toàn bộ cue, phát hiện speaker và lưu danh sách tại:
+     - `outputs/vtt/speakers_detected.json`
+
+3. **Map giọng cho từng speaker**
+   - Mỗi speaker phải có:
+     - một `Preset Voice`
+     - hoặc một `Clone Audio`
+   - Nếu bạn clone giọng trong **Standard mode**, cần nhập thêm `Reference Text`.
+   - Không có cơ chế tự gán ngẫu nhiên speaker chưa map.
+
+4. **Thiết lập tốc độ cho từng speaker**
+   - `Speed` mặc định là `1.0`
+   - Có thể chỉnh từ `0.7` đến `1.5`
+   - Giá trị này được áp dụng riêng cho từng cue theo speaker bằng FFmpeg `atempo`
+
+5. **Thiết lập Global Settings**
+   - `Mode`: phải khớp với backbone đang tải (`standard` hoặc `turbo`)
+   - `Emotion`: `natural` hoặc `storytelling`
+   - `Overflow Mode`:
+     - `keep`: giữ nguyên nếu audio dài hơn subtitle
+     - `speedup`: tự tăng tốc thêm đến mức `Max Speedup`
+     - `truncate`: cắt audio theo đúng duration subtitle
+   - `Worker Threads`: số thread dùng để render cue song song, mặc định `2`
+
+6. **Nhấn `Generate Final Audio`**
+   - Mỗi cue sẽ được sinh ra thành file WAV riêng tại:
+     - `outputs/vtt/temp/audio/`
+   - File cuối cùng được ghép timeline và lưu tại:
+     - `outputs/vtt/final_audio.wav`
+   - Log chi tiết được ghi tại:
+     - `outputs/vtt/logs/vtt_generation.log`
+
+7. **Nghe thử và tải file**
+   - Tab sẽ hiển thị audio preview
+   - Có thể tải trực tiếp file `final_audio.wav` từ giao diện
+
+### Ghi chú hiệu năng CPU
+- Với CPU yếu, nên dùng backbone `VieNeu-TTS-v2-Turbo (CPU)` để giảm thời gian render.
+- `Worker Threads` lớn hơn không luôn nhanh hơn, vì phần `tts.infer()` vẫn được khóa để tránh race condition giữa nhiều thread dùng chung model.
+- Nếu subtitle rất dài, hãy bắt đầu với `2` hoặc `3` worker để cân bằng tốc độ và mức sử dụng RAM.
+
+### Troubleshooting cho `VTT Dubbing`
+- **Không thấy preset voice trong bảng mapping:** hãy tải model trước, sau đó `Detect Speakers` lại nếu cần.
+- **Báo lỗi mode không khớp:** chọn `Mode` đúng với backbone hiện đang load, hoặc reload model khác.
+- **Báo lỗi FFmpeg:** kiểm tra `ffmpeg -version` hoặc đặt `FFMPEG_PATH`.
+- **Clone giọng ở Standard mode bị lỗi:** bổ sung `Reference Text` cho speaker đó.
+- **Audio dài hơn subtitle:** thử `Overflow Mode = speedup` hoặc `truncate`.
+- **Máy chạy chậm:** giảm số `Worker Threads`, hoặc chuyển sang backbone Turbo CPU.
+
 ---
 
 ## 📦 2. Sử dụng Python SDK (vieneu) <a name="sdk"></a>

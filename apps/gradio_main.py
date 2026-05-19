@@ -16,6 +16,18 @@ from vieneu_utils.phonemize_text import phonemize_with_dict
 from sea_g2p import Normalizer
 from functools import lru_cache
 import gc
+from apps.vtt_dubbing import (
+    FINAL_AUDIO_PATH,
+    LOG_FILE_PATH,
+    MAX_VTT_SPEAKERS,
+    OUTPUT_ROOT,
+    RunLogger,
+    append_log_line,
+    detect_vtt_speakers,
+    generate_vtt_dubbing,
+    parse_vtt_file,
+    summarize_unknown_cues,
+)
 
 # --- CONSTANTS & CONFIG ---
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
@@ -105,6 +117,7 @@ using_lmdeploy = False
 PRESET_VOICES_CACHE = []  # List of all voices (tuples or strings)
 CONV_VOICES_CACHE = []    # Filtered list for conversation (podcast=True)
 MAX_SPEAKERS = 8          # Max concurrent speakers in conversation tab
+VTT_TTS_LOCK = threading.Lock()
 
 # Normalizer (module-level singleton)
 _text_normalizer = Normalizer()
@@ -1382,6 +1395,204 @@ def extract_speakers_from_script(script):
     return name_updates + dd_updates + row_updates
 
 
+def _build_vtt_mapping_updates(status_message: str, speakers: list[str]):
+    voice_choices = PRESET_VOICES_CACHE if PRESET_VOICES_CACHE else []
+    rows_visible = len(speakers) > 0
+    generate_button_update = gr.update(interactive=model_loaded and rows_visible)
+
+    speaker_updates = []
+    voice_updates = []
+    audio_updates = []
+    ref_text_updates = []
+    speed_updates = []
+    row_updates = []
+
+    for idx in range(MAX_VTT_SPEAKERS):
+        is_visible = idx < len(speakers)
+        speaker_updates.append(gr.update(value=speakers[idx] if is_visible else ""))
+        voice_updates.append(
+            gr.update(
+                choices=voice_choices,
+                value=None,
+                interactive=bool(voice_choices),
+            )
+        )
+        audio_updates.append(gr.update(value=None))
+        ref_text_updates.append(gr.update(value=""))
+        speed_updates.append(gr.update(value=1.0))
+        row_updates.append(gr.update(visible=is_visible))
+
+    return [
+        status_message,
+        speakers,
+        generate_button_update,
+        *speaker_updates,
+        *voice_updates,
+        *audio_updates,
+        *ref_text_updates,
+        *speed_updates,
+        *row_updates,
+    ]
+
+
+def get_loaded_vtt_mode() -> str:
+    return "turbo" if "v2-Turbo" in (current_backbone or "") else "standard"
+
+
+def get_loaded_vtt_mode_message() -> str:
+    if not model_loaded or not current_backbone:
+        return "Mode hiện hành: chưa tải model."
+    return f"Mode hiện hành theo model đã tải: `{get_loaded_vtt_mode()}` (`{current_backbone}`)."
+
+
+def refresh_vtt_voice_components(speakers_state=None):
+    voice_choices = PRESET_VOICES_CACHE if PRESET_VOICES_CACHE else []
+    speakers_state = speakers_state or []
+    button_update = gr.update(interactive=model_loaded and bool(speakers_state))
+    mode_update = gr.update(value=get_loaded_vtt_mode())
+    mode_message_update = get_loaded_vtt_mode_message()
+    dropdown_updates = [
+        gr.update(choices=voice_choices, interactive=bool(voice_choices))
+        for _ in range(MAX_VTT_SPEAKERS)
+    ]
+    return [button_update, mode_update, mode_message_update, *dropdown_updates]
+
+
+def detect_vtt_speakers_ui(vtt_file):
+    if not vtt_file:
+        return _build_vtt_mapping_updates("⚠️ Vui lòng upload file .vtt trước khi detect speakers.", [])
+
+    try:
+        cues = parse_vtt_file(vtt_file)
+        speakers = detect_vtt_speakers(vtt_file, output_root=OUTPUT_ROOT)
+    except Exception as e:
+        append_log_line(f"Detect speakers thất bại: {e}", output_root=OUTPUT_ROOT, reset=False)
+        return _build_vtt_mapping_updates(f"❌ Không thể đọc file VTT: {str(e)}", [])
+
+    if len(speakers) > MAX_VTT_SPEAKERS:
+        message = (
+            f"❌ File VTT có {len(speakers)} speakers, vượt quá giới hạn UI hiện tại là {MAX_VTT_SPEAKERS}. "
+            "Hãy rút gọn hoặc gộp speaker trước khi generate."
+        )
+        append_log_line(message, output_root=OUTPUT_ROOT, reset=False)
+        return _build_vtt_mapping_updates(message, [])
+
+    message = (
+        f"✅ Đã phát hiện {len(speakers)} speakers và lưu file speakers_detected.json tại {OUTPUT_ROOT / 'speakers_detected.json'}."
+    )
+    unknown_summary = summarize_unknown_cues(cues)
+    if unknown_summary:
+        message += f" Có cue bị gán 'Unknown': {unknown_summary}"
+    if not PRESET_VOICES_CACHE:
+        message += " Tải model để thấy danh sách preset voices."
+    append_log_line(message, output_root=OUTPUT_ROOT, reset=False)
+    return _build_vtt_mapping_updates(message, speakers)
+
+
+def generate_vtt_dubbing_ui(
+    vtt_file,
+    selected_mode,
+    emotion,
+    overflow_mode,
+    max_speedup,
+    worker_threads,
+    *args
+):
+    global tts, model_loaded, current_backbone
+
+    if not model_loaded or tts is None:
+        yield None, None, "⚠️ Vui lòng tải model trước khi generate VTT dubbing."
+        return
+
+    if not vtt_file:
+        yield None, None, "⚠️ Vui lòng upload file .vtt."
+        return
+
+    expected_mode = get_loaded_vtt_mode()
+    effective_mode = expected_mode
+
+    notes = []
+    if selected_mode != expected_mode:
+        notes.append(
+            f"⚠️ Mode đang chọn là '{selected_mode}', nhưng model đã load đang chạy theo '{expected_mode}'. Hệ thống sẽ tự dùng '{expected_mode}'."
+        )
+
+    if effective_mode == "turbo":
+        notes.append("⚠️ Turbo backend hiện bỏ qua emotion tag; setting emotion chỉ được lưu vào log.")
+
+    speaker_names = list(args[:MAX_VTT_SPEAKERS])
+    speaker_voices = list(args[MAX_VTT_SPEAKERS:MAX_VTT_SPEAKERS * 2])
+    speaker_ref_audios = list(args[MAX_VTT_SPEAKERS * 2:MAX_VTT_SPEAKERS * 3])
+    speaker_ref_texts = list(args[MAX_VTT_SPEAKERS * 3:MAX_VTT_SPEAKERS * 4])
+    speaker_speeds = list(args[MAX_VTT_SPEAKERS * 4:MAX_VTT_SPEAKERS * 5])
+
+    logger = RunLogger(LOG_FILE_PATH, reset=True)
+    logger.info("Khởi động VTT dubbing job từ Gradio UI.")
+    for note in notes:
+        logger.warning(note)
+
+    status_queue = queue.Queue()
+    result_holder = {"path": None}
+    error_holder = {"message": None}
+
+    def publish_status(message: str):
+        status_queue.put(("status", message))
+
+    def worker():
+        try:
+            output_path = generate_vtt_dubbing(
+                tts_engine=tts,
+                tts_lock=VTT_TTS_LOCK,
+                vtt_path=vtt_file,
+                selected_mode=effective_mode,
+                emotion=emotion,
+                overflow_mode=overflow_mode,
+                max_speedup=float(max_speedup),
+                worker_count=int(worker_threads),
+                speakers=speaker_names,
+                voice_ids=speaker_voices,
+                reference_audio_paths=speaker_ref_audios,
+                reference_texts=speaker_ref_texts,
+                speeds=speaker_speeds,
+                logger=logger,
+                status_callback=publish_status,
+                output_root=OUTPUT_ROOT,
+            )
+            result_holder["path"] = str(output_path)
+        except Exception as e:
+            logger.error(str(e))
+            error_holder["message"] = str(e)
+        finally:
+            status_queue.put(("done", logger.render()))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    initial_status = logger.render() or "⏳ Đang khởi tạo VTT dubbing..."
+    yield None, None, initial_status
+
+    last_status = initial_status
+    while True:
+        try:
+            event_type, payload = status_queue.get(timeout=0.25)
+        except queue.Empty:
+            yield None, None, last_status
+            continue
+
+        if event_type == "status":
+            last_status = payload
+            yield None, None, last_status
+            continue
+
+        last_status = payload
+        if error_holder["message"]:
+            yield None, None, last_status
+            return
+
+        final_path = result_holder["path"] or str(FINAL_AUDIO_PATH)
+        yield final_path, final_path, last_status
+        return
+
+
 # --- 4. UI SETUP ---
 theme = gr.themes.Soft(
     primary_hue="indigo",
@@ -1511,6 +1722,13 @@ css = """
 }
 .speaker-table {
     margin-top: 10px;
+}
+.vtt-speaker-group {
+    border: 1px solid rgba(99, 102, 241, 0.12);
+    border-radius: 12px;
+    padding: 10px 12px 2px 12px;
+    background: rgba(248, 250, 252, 0.9);
+    margin-bottom: 10px;
 }
 """
 
@@ -1778,6 +1996,137 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         
                         btn_generate_conv = gr.Button("🎭 Bắt đầu hội thoại", variant="primary", interactive=False)
 
+                    # --- TAB 3: VTT DUBBING ---
+                    with gr.Tab("🎬 VTT Dubbing", id="vtt_tab"):
+                        vtt_speakers_state = gr.State([])
+
+                        vtt_file_input = gr.File(
+                            label="📄 Upload WebVTT (.vtt)",
+                            file_types=[".vtt"],
+                            type="filepath",
+                        )
+
+                        with gr.Row():
+                            btn_detect_vtt_speakers = gr.Button("🔍 Detect Speakers", variant="secondary")
+                            vtt_generate_button = gr.Button("🎬 Generate Final Audio", variant="primary", interactive=False)
+
+                        gr.Markdown(
+                            "### 🎭 Speaker Mapping\n"
+                            "Mỗi speaker phải chọn một preset voice hoặc upload reference audio để clone. "
+                            "Nếu clone ở Standard mode, cần nhập thêm Reference Text."
+                        )
+
+                        vtt_speaker_name_boxes = []
+                        vtt_voice_dds = []
+                        vtt_ref_audio_inputs = []
+                        vtt_ref_text_inputs = []
+                        vtt_speed_sliders = []
+                        vtt_speaker_rows = []
+
+                        for _i in range(MAX_VTT_SPEAKERS):
+                            with gr.Group(visible=False, elem_classes="vtt-speaker-group") as _vtt_row:
+                                with gr.Row():
+                                    _speaker_box = gr.Textbox(
+                                        label="👤 Speaker",
+                                        interactive=False,
+                                        scale=1,
+                                        min_width=140,
+                                    )
+                                    _voice_dd = gr.Dropdown(
+                                        choices=PRESET_VOICES_CACHE,
+                                        value=None,
+                                        label="🎤 Preset Voice",
+                                        interactive=False,
+                                        allow_custom_value=False,
+                                        scale=2,
+                                        min_width=180,
+                                    )
+                                    _speed = gr.Slider(
+                                        minimum=0.7,
+                                        maximum=1.5,
+                                        value=1.0,
+                                        step=0.05,
+                                        label="⏩ Speed",
+                                        scale=1,
+                                        min_width=180,
+                                    )
+                                with gr.Row():
+                                    _ref_audio = gr.File(
+                                        label="🦜 Clone Audio",
+                                        file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
+                                        type="filepath",
+                                        scale=1,
+                                        min_width=220,
+                                    )
+                                    _ref_text = gr.Textbox(
+                                        label="📝 Reference Text",
+                                        placeholder="Bắt buộc nếu clone ở Standard mode",
+                                        lines=2,
+                                        max_lines=2,
+                                        scale=2,
+                                        min_width=260,
+                                    )
+
+                            vtt_speaker_rows.append(_vtt_row)
+                            vtt_speaker_name_boxes.append(_speaker_box)
+                            vtt_voice_dds.append(_voice_dd)
+                            vtt_ref_audio_inputs.append(_ref_audio)
+                            vtt_ref_text_inputs.append(_ref_text)
+                            vtt_speed_sliders.append(_speed)
+
+                        gr.Markdown("### ⚙️ Global Settings")
+                        with gr.Row():
+                            vtt_mode = gr.Radio(
+                                ["standard", "turbo"],
+                                value="standard",
+                                label="Mode",
+                                info="UI sẽ tự đồng bộ theo model đã tải; nếu lệch, hệ thống sẽ dùng mode thực tế.",
+                            )
+                            vtt_emotion = gr.Radio(
+                                ["natural", "storytelling"],
+                                value="natural",
+                                label="Emotion",
+                            )
+                            vtt_overflow_mode = gr.Radio(
+                                ["keep", "speedup", "truncate"],
+                                value="keep",
+                                label="Overflow Mode",
+                            )
+
+                        with gr.Row():
+                            vtt_max_speedup = gr.Slider(
+                                minimum=1.0,
+                                maximum=3.0,
+                                value=1.25,
+                                step=0.05,
+                                label="Max Speedup",
+                            )
+                            vtt_worker_threads = gr.Slider(
+                                minimum=1,
+                                maximum=8,
+                                value=2,
+                                step=1,
+                                label="Worker Threads",
+                            )
+
+                        vtt_mode_runtime_note = gr.Markdown("Mode hiện hành: chưa tải model.")
+
+                        vtt_status_output = gr.Textbox(
+                            label="Tiến trình / Log",
+                            lines=14,
+                            max_lines=30,
+                            show_copy_button=True,
+                        )
+
+                        with gr.Row():
+                            vtt_audio_output = gr.Audio(
+                                label="Final Audio Preview",
+                                type="filepath",
+                            )
+                            vtt_download_output = gr.File(
+                                label="Download final_audio.wav",
+                            )
+
                 # Global Generation Settings
                 with gr.Row():
                     use_batch = gr.Checkbox(
@@ -1948,7 +2297,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             outputs=[custom_backbone_base_model, custom_audio, custom_text]
         )
 
-        btn_load.click(
+        load_event = btn_load.click(
             fn=load_model,
             inputs=[backbone_select, codec_select, device_choice, use_lmdeploy_cb,
                     custom_backbone_model_id, custom_backbone_base_model, custom_backbone_hf_token],
@@ -1956,6 +2305,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                      tab_preset, tab_custom, tabs, current_mode_state,
                      conv_tab,
                      *speaker_voice_dds]
+        )
+        load_event.then(
+            fn=refresh_vtt_voice_components,
+            inputs=[vtt_speakers_state],
+            outputs=[vtt_generate_button, vtt_mode, vtt_mode_runtime_note, *vtt_voice_dds]
         )
         
         # --- Conversation Event Handlers ---
@@ -1977,6 +2331,41 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         )
         btn_generate_conv.click(lambda: gr.update(interactive=True), outputs=btn_stop)
         conv_gen_event.then(lambda: gr.update(interactive=False), outputs=btn_stop)
+
+        # --- VTT Dubbing Event Handlers ---
+        btn_detect_vtt_speakers.click(
+            fn=detect_vtt_speakers_ui,
+            inputs=[vtt_file_input],
+            outputs=[
+                vtt_status_output,
+                vtt_speakers_state,
+                vtt_generate_button,
+                *vtt_speaker_name_boxes,
+                *vtt_voice_dds,
+                *vtt_ref_audio_inputs,
+                *vtt_ref_text_inputs,
+                *vtt_speed_sliders,
+                *vtt_speaker_rows,
+            ],
+        )
+
+        vtt_generate_button.click(
+            fn=generate_vtt_dubbing_ui,
+            inputs=[
+                vtt_file_input,
+                vtt_mode,
+                vtt_emotion,
+                vtt_overflow_mode,
+                vtt_max_speedup,
+                vtt_worker_threads,
+                *vtt_speaker_name_boxes,
+                *vtt_voice_dds,
+                *vtt_ref_audio_inputs,
+                *vtt_ref_text_inputs,
+                *vtt_speed_sliders,
+            ],
+            outputs=[vtt_audio_output, vtt_download_output, vtt_status_output],
+        )
 
         # --- Auto-adjust Temperature on Tab Switch ---
         conv_tab.select(
@@ -2014,6 +2403,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         demo.load(
             fn=restore_ui_state,
             outputs=[model_status, btn_generate, btn_generate_conv, btn_stop]
+        )
+        demo.load(
+            fn=refresh_vtt_voice_components,
+            inputs=[vtt_speakers_state],
+            outputs=[vtt_generate_button, vtt_mode, vtt_mode_runtime_note, *vtt_voice_dds]
         )
 
 def main():
