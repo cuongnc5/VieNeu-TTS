@@ -105,6 +105,10 @@ Tính năng `VTT Dubbing` dùng FFmpeg để tăng/giảm tốc độ từng spe
 Sau khi mở Web UI và tải model, chọn tab `VTT Dubbing` để tạo một file audio duy nhất từ subtitle `.vtt`.
 
 1. **Upload file `.vtt`**
+   - Có thể upload thêm `MP4` gốc nếu muốn hệ thống tự mux audio dub vào video sau khi render xong.
+   - Nếu có MP4, có thể chọn thêm `Subtitle Export`:
+     - `Burn subtitle into video`: đóng cứng subtitle vào hình
+     - `Add subtitle track only`: thêm subtitle mềm vào MP4
    - Hỗ trợ các định dạng speaker:
      - `Speaker: Xin chào`
      - `[Speaker] Xin chào`
@@ -140,13 +144,19 @@ Sau khi mở Web UI và tải model, chọn tab `VTT Dubbing` để tạo một 
    - Mỗi cue sẽ được sinh ra thành file WAV riêng tại:
      - `outputs/vtt/temp/audio/`
    - File cuối cùng được ghép timeline và lưu tại:
-     - `outputs/vtt/final_audio.wav`
+     - `outputs/vtt/<ten_file_vtt>_<timestamp>.wav`
+   - Nếu có upload MP4, hệ thống sẽ tạo thêm:
+     - `outputs/vtt/<ten_file_vtt>_<timestamp>.mp4`
+     - Giữ audio gốc là track 1, thêm audio dub là track 2 và đặt track dub làm mặc định
+     - Nếu chọn `Burn subtitle into video`, subtitle từ file `.vtt` sẽ được render trực tiếp lên video
+     - Nếu chọn `Add subtitle track only`, subtitle `.vtt` sẽ được thêm như một track mềm trong MP4
    - Log chi tiết được ghi tại:
      - `outputs/vtt/logs/vtt_generation.log`
+   - Sau khi tạo final outputs thành công, hệ thống sẽ tự xóa file temp/cache/cue audio để tiết kiệm dung lượng
 
 7. **Nghe thử và tải file**
    - Tab sẽ hiển thị audio preview
-   - Có thể tải trực tiếp file `final_audio.wav` từ giao diện
+   - Có thể tải trực tiếp file audio đã render và file MP4 đã mux từ giao diện
 
 ### Ghi chú hiệu năng CPU
 - Với CPU yếu, nên dùng backbone `VieNeu-TTS-v2-Turbo (CPU)` để giảm thời gian render.

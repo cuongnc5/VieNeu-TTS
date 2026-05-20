@@ -6,6 +6,7 @@ from vieneu import Vieneu
 import os
 import sys
 import time
+from datetime import datetime
 import numpy as np
 import queue
 import threading
@@ -17,12 +18,16 @@ from sea_g2p import Normalizer
 from functools import lru_cache
 import gc
 from apps.vtt_dubbing import (
-    FINAL_AUDIO_PATH,
     LOG_FILE_PATH,
     MAX_VTT_SPEAKERS,
     OUTPUT_ROOT,
     RunLogger,
+    SUBTITLE_EXPORT_BURN,
+    SUBTITLE_EXPORT_NONE,
+    SUBTITLE_EXPORT_SOFT,
     append_log_line,
+    build_vtt_output_path,
+    build_vtt_video_output_path,
     detect_vtt_speakers,
     generate_vtt_dubbing,
     parse_vtt_file,
@@ -1491,6 +1496,8 @@ def detect_vtt_speakers_ui(vtt_file):
 
 def generate_vtt_dubbing_ui(
     vtt_file,
+    mp4_file,
+    subtitle_export_mode,
     selected_mode,
     emotion,
     overflow_mode,
@@ -1501,11 +1508,11 @@ def generate_vtt_dubbing_ui(
     global tts, model_loaded, current_backbone
 
     if not model_loaded or tts is None:
-        yield None, None, "⚠️ Vui lòng tải model trước khi generate VTT dubbing."
+        yield None, None, None, "⚠️ Vui lòng tải model trước khi generate VTT dubbing."
         return
 
     if not vtt_file:
-        yield None, None, "⚠️ Vui lòng upload file .vtt."
+        yield None, None, None, "⚠️ Vui lòng upload file .vtt."
         return
 
     expected_mode = get_loaded_vtt_mode()
@@ -1531,8 +1538,16 @@ def generate_vtt_dubbing_ui(
     for note in notes:
         logger.warning(note)
 
+    job_timestamp = datetime.now()
+    planned_output_path = build_vtt_output_path(vtt_file, output_root=OUTPUT_ROOT, generated_at=job_timestamp)
+    planned_video_output_path = (
+        build_vtt_video_output_path(vtt_file, output_root=OUTPUT_ROOT, generated_at=job_timestamp)
+        if mp4_file
+        else None
+    )
     status_queue = queue.Queue()
     result_holder = {"path": None}
+    video_result_holder = {"path": None}
     error_holder = {"message": None}
 
     def publish_status(message: str):
@@ -1544,6 +1559,7 @@ def generate_vtt_dubbing_ui(
                 tts_engine=tts,
                 tts_lock=VTT_TTS_LOCK,
                 vtt_path=vtt_file,
+                subtitle_export_mode=subtitle_export_mode,
                 selected_mode=effective_mode,
                 emotion=emotion,
                 overflow_mode=overflow_mode,
@@ -1557,8 +1573,12 @@ def generate_vtt_dubbing_ui(
                 logger=logger,
                 status_callback=publish_status,
                 output_root=OUTPUT_ROOT,
+                output_path=planned_output_path,
+                video_input_path=mp4_file,
+                video_output_path=planned_video_output_path,
             )
             result_holder["path"] = str(output_path)
+            video_result_holder["path"] = str(planned_video_output_path) if planned_video_output_path else None
         except Exception as e:
             logger.error(str(e))
             error_holder["message"] = str(e)
@@ -1568,28 +1588,29 @@ def generate_vtt_dubbing_ui(
     threading.Thread(target=worker, daemon=True).start()
 
     initial_status = logger.render() or "⏳ Đang khởi tạo VTT dubbing..."
-    yield None, None, initial_status
+    yield None, None, None, initial_status
 
     last_status = initial_status
     while True:
         try:
             event_type, payload = status_queue.get(timeout=0.25)
         except queue.Empty:
-            yield None, None, last_status
+            yield None, None, None, last_status
             continue
 
         if event_type == "status":
             last_status = payload
-            yield None, None, last_status
+            yield None, None, None, last_status
             continue
 
         last_status = payload
         if error_holder["message"]:
-            yield None, None, last_status
+            yield None, None, None, last_status
             return
 
-        final_path = result_holder["path"] or str(FINAL_AUDIO_PATH)
-        yield final_path, final_path, last_status
+        final_path = result_holder["path"] or str(planned_output_path)
+        final_video_path = video_result_holder["path"]
+        yield final_path, final_path, final_video_path, last_status
         return
 
 
@@ -2000,11 +2021,17 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     with gr.Tab("🎬 VTT Dubbing", id="vtt_tab"):
                         vtt_speakers_state = gr.State([])
 
-                        vtt_file_input = gr.File(
-                            label="📄 Upload WebVTT (.vtt)",
-                            file_types=[".vtt"],
-                            type="filepath",
-                        )
+                        with gr.Row():
+                            vtt_file_input = gr.File(
+                                label="📄 Upload WebVTT (.vtt)",
+                                file_types=[".vtt"],
+                                type="filepath",
+                            )
+                            vtt_mp4_input = gr.File(
+                                label="🎞️ Optional MP4",
+                                file_types=[".mp4"],
+                                type="filepath",
+                            )
 
                         with gr.Row():
                             btn_detect_vtt_speakers = gr.Button("🔍 Detect Speakers", variant="secondary")
@@ -2092,6 +2119,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                                 value="keep",
                                 label="Overflow Mode",
                             )
+                            vtt_subtitle_export_mode = gr.Radio(
+                                [SUBTITLE_EXPORT_NONE, SUBTITLE_EXPORT_BURN, SUBTITLE_EXPORT_SOFT],
+                                value=SUBTITLE_EXPORT_NONE,
+                                label="Subtitle Export",
+                            )
 
                         with gr.Row():
                             vtt_max_speedup = gr.Slider(
@@ -2124,7 +2156,10 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                                 type="filepath",
                             )
                             vtt_download_output = gr.File(
-                                label="Download final_audio.wav",
+                                label="Download dubbed audio",
+                            )
+                            vtt_video_download_output = gr.File(
+                                label="Download muxed MP4",
                             )
 
                 # Global Generation Settings
@@ -2353,6 +2388,8 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             fn=generate_vtt_dubbing_ui,
             inputs=[
                 vtt_file_input,
+                vtt_mp4_input,
+                vtt_subtitle_export_mode,
                 vtt_mode,
                 vtt_emotion,
                 vtt_overflow_mode,
@@ -2364,7 +2401,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 *vtt_ref_text_inputs,
                 *vtt_speed_sliders,
             ],
-            outputs=[vtt_audio_output, vtt_download_output, vtt_status_output],
+            outputs=[vtt_audio_output, vtt_download_output, vtt_video_download_output, vtt_status_output],
         )
 
         # --- Auto-adjust Temperature on Tab Switch ---
