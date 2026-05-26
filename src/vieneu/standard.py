@@ -196,23 +196,90 @@ class VieNeuTTS(BaseVieneuTTS):
     def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        original_text = text
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)
 
         chunks = split_text_into_chunks(text, max_chars=max_chars)
+        self._log_text_preparation(logger, original_text, text, chunks)
         if not chunks:
             return np.array([], dtype=np.float32)
 
         if len(chunks) == 1:
             ref_phonemes = self.get_ref_phonemes(ref_text)
+            self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
             phonemes = phonemize_with_dict(chunks[0], skip_normalize=True)
+            guard = self._build_generation_guard(
+                chunks[0],
+                phonemes,
+                target_duration_s=kwargs.get("target_duration"),
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            sampling = self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.15 if self._is_quantized_model else 1.10,
+            )
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=0,
+                total_chunks=1,
+                chunk_text=chunks[0],
+                chunk_phonemes=phonemes,
+                extra={
+                    "guard_max_tokens": guard["max_new_tokens"],
+                    "guard_short_text": guard["short_text"],
+                    "guard_compact": guard["repetitive_compact"],
+                    "guard_max_sec": guard["desired_max_duration_s"],
+                    "guard_temp": sampling["temperature"],
+                    "guard_top_k": sampling["top_k"],
+                },
+            )
             if self._is_quantized_model:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
+                output_str = self._infer_ggml(
+                    ref_codes,
+                    ref_phonemes,
+                    phonemes,
+                    sampling["temperature"],
+                    sampling["top_k"],
+                    emotion_tag=kwargs.get('emotion_tag', self.default_emotion),
+                    max_new_tokens=guard["max_new_tokens"],
+                    repetition_penalty=sampling["repetition_penalty"],
+                )
             else:
                 prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
-                output_str = self._infer_torch(prompt_ids, temperature, top_k)
+                output_str = self._infer_torch(
+                    prompt_ids,
+                    sampling["temperature"],
+                    sampling["top_k"],
+                    max_new_tokens=guard["max_new_tokens"],
+                    min_new_tokens=guard["min_new_tokens"],
+                    repetition_penalty=sampling["repetition_penalty"],
+                )
+            output_str = self._apply_generation_guard(
+                logger,
+                chunk_text=chunks[0],
+                chunk_phonemes=phonemes,
+                output_str=output_str,
+                guard=guard,
+            )
             wav = self._decode(output_str)
+            self._log_generation_result(
+                logger,
+                chunk_index=0,
+                total_chunks=1,
+                chunk_text=chunks[0],
+                chunk_phonemes=phonemes,
+                output_str=output_str,
+                wav=wav,
+            )
             if apply_watermark:
                 wav = self._apply_watermark(wav)
             return wav
@@ -234,19 +301,83 @@ class VieNeuTTS(BaseVieneuTTS):
 
     def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        texts = self._prepare_texts_for_inference(
+            logger,
+            texts,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             texts = [self.normalizer.normalize(t) for t in texts]
 
         ref_phonemes = self.get_ref_phonemes(ref_text)
+        self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
         chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+        guards = [
+            self._build_generation_guard(
+                text,
+                phonemes,
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            for text, phonemes in zip(texts, chunk_phonemes)
+        ]
+        samplings = [
+            self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.15 if self._is_quantized_model else 1.10,
+            )
+            for guard in guards
+        ]
+        for i, (text, phonemes) in enumerate(zip(texts, chunk_phonemes)):
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(texts),
+                chunk_text=text,
+                chunk_phonemes=phonemes,
+                extra={
+                    "guard_max_tokens": guards[i]["max_new_tokens"],
+                    "guard_short_text": guards[i]["short_text"],
+                    "guard_compact": guards[i]["repetitive_compact"],
+                    "guard_max_sec": guards[i]["desired_max_duration_s"],
+                    "guard_temp": samplings[i]["temperature"],
+                    "guard_top_k": samplings[i]["top_k"],
+                },
+            )
 
         all_wavs = []
         # If model is GGUF, we still process sequentially for now as llama-cpp-python batching for TTS is complex
         if self._is_quantized_model:
-            for phonemes in chunk_phonemes:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
+            for i, (text, phonemes) in enumerate(zip(texts, chunk_phonemes)):
+                output_str = self._infer_ggml(
+                    ref_codes,
+                    ref_phonemes,
+                    phonemes,
+                    samplings[i]["temperature"],
+                    samplings[i]["top_k"],
+                    emotion_tag=kwargs.get('emotion_tag', self.default_emotion),
+                    max_new_tokens=guards[i]["max_new_tokens"],
+                    repetition_penalty=samplings[i]["repetition_penalty"],
+                )
+                output_str = self._apply_generation_guard(
+                    logger,
+                    chunk_text=text,
+                    chunk_phonemes=phonemes,
+                    output_str=output_str,
+                    guard=guards[i],
+                )
                 wav = self._decode(output_str)
+                self._log_generation_result(
+                    logger,
+                    chunk_index=i,
+                    total_chunks=len(texts),
+                    chunk_text=text,
+                    chunk_phonemes=phonemes,
+                    output_str=output_str,
+                    wav=wav,
+                )
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
                 all_wavs.append(wav)
@@ -273,17 +404,35 @@ class VieNeuTTS(BaseVieneuTTS):
                     max_length=self.max_context,
                     eos_token_id=speech_end_id,
                     do_sample=True,
-                    temperature=temperature,
-                    top_k=top_k,
+                    temperature=min(sampling["temperature"] for sampling in samplings),
+                    top_k=min(sampling["top_k"] for sampling in samplings),
                     use_cache=True,
-                    min_new_tokens=50,
+                    max_new_tokens=max(guard["max_new_tokens"] for guard in guards),
+                    min_new_tokens=min(guard["min_new_tokens"] for guard in guards),
+                    repetition_penalty=max(sampling["repetition_penalty"] for sampling in samplings),
                 )
 
             input_length = inputs["input_ids"].shape[-1]
             for i in range(len(texts)):
                 generated_ids = output_tokens[i, input_length:]
                 output_str = self.tokenizer.decode(generated_ids, add_special_tokens=False)
+                output_str = self._apply_generation_guard(
+                    logger,
+                    chunk_text=texts[i],
+                    chunk_phonemes=chunk_phonemes[i],
+                    output_str=output_str,
+                    guard=guards[i],
+                )
                 wav = self._decode(output_str)
+                self._log_generation_result(
+                    logger,
+                    chunk_index=i,
+                    total_chunks=len(texts),
+                    chunk_text=texts[i],
+                    chunk_phonemes=chunk_phonemes[i],
+                    output_str=output_str,
+                    wav=wav,
+                )
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
                 all_wavs.append(wav)
@@ -293,6 +442,11 @@ class VieNeuTTS(BaseVieneuTTS):
     def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes=None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)
@@ -344,7 +498,7 @@ class VieNeuTTS(BaseVieneuTTS):
 
         return ids
 
-    def _infer_torch(self, prompt_ids: List[int], temperature: float = 1.0, top_k: int = 50) -> str:
+    def _infer_torch(self, prompt_ids: List[int], temperature: float = 1.0, top_k: int = 50, max_new_tokens: int = 512, min_new_tokens: int = 20, repetition_penalty: float = 1.10) -> str:
         import torch
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to(self.backbone.device)
         speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
@@ -352,18 +506,20 @@ class VieNeuTTS(BaseVieneuTTS):
             output_tokens = self.backbone.generate(
                 prompt_tensor,
                 max_length=self.max_context,
+                max_new_tokens=max_new_tokens,
                 eos_token_id=speech_end_id,
                 do_sample=True,
                 temperature=temperature,
                 top_k=top_k,
                 use_cache=True,
-                min_new_tokens=50,
+                min_new_tokens=min_new_tokens,
+                repetition_penalty=repetition_penalty,
             )
         input_length = prompt_tensor.shape[-1]
         output_str = self.tokenizer.decode(output_tokens[0, input_length:].cpu().numpy().tolist(), add_special_tokens=False)
         return output_str
 
-    def _infer_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> str:
+    def _infer_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None, max_new_tokens: int = 512, repetition_penalty: float = 1.15) -> str:
         ref_codes_list = self.to_list(ref_codes)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
         emotion_prefix = emotion_tag if emotion_tag else ""
@@ -377,7 +533,7 @@ class VieNeuTTS(BaseVieneuTTS):
                 f"<|TEXT_PROMPT_START|>{emotion_prefix}{ref_phonemes} {chunk_phonemes}"
                 f"<|TEXT_PROMPT_END|><|SPEECH_GENERATION_START|>{codes_str}"
             )
-        output = self.backbone(prompt, max_tokens=self.max_context, temperature=temperature, top_k=top_k, stop=["<|SPEECH_GENERATION_END|>"])
+        output = self.backbone(prompt, max_tokens=max_new_tokens, temperature=temperature, top_k=top_k, repeat_penalty=repetition_penalty, stop=["<|SPEECH_GENERATION_END|>"])
         return output["choices"][0]["text"]
 
     def _infer_stream_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> Generator[np.ndarray, None, None]:

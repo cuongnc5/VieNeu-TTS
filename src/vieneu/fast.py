@@ -127,6 +127,12 @@ class FastVieNeuTTS(BaseVieneuTTS):
     def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        original_text = text
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)
@@ -135,19 +141,87 @@ class FastVieNeuTTS(BaseVieneuTTS):
         self.gen_config.top_k = top_k
 
         chunks = split_text_into_chunks(text, max_chars=max_chars)
+        self._log_text_preparation(logger, original_text, text, chunks)
         if not chunks:
             return np.array([], dtype=np.float32)
 
         if len(chunks) == 1:
-            prompt = self._format_prompt(ref_codes, ref_text, chunks[0], 
-                                        use_chat_format=self.use_chat_format,
-                                        emotion_tag=kwargs.get('emotion_tag'))
+            ref_phonemes = self.get_ref_phonemes(ref_text)
+            self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
+            chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
+            guard = self._build_generation_guard(
+                chunks[0],
+                chunk_phonemes[0],
+                target_duration_s=kwargs.get("target_duration"),
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            sampling = self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=self.gen_config.repetition_penalty,
+            )
+            self.gen_config.max_new_tokens = guard["max_new_tokens"]
+            self.gen_config.min_new_tokens = guard["min_new_tokens"]
+            self.gen_config.temperature = sampling["temperature"]
+            self.gen_config.top_k = sampling["top_k"]
+            self.gen_config.repetition_penalty = sampling["repetition_penalty"]
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=0,
+                total_chunks=1,
+                chunk_text=chunks[0],
+                chunk_phonemes=chunk_phonemes[0],
+                extra={
+                    "guard_max_tokens": guard["max_new_tokens"],
+                    "guard_short_text": guard["short_text"],
+                    "guard_compact": guard["repetitive_compact"],
+                    "guard_max_sec": guard["desired_max_duration_s"],
+                    "guard_temp": sampling["temperature"],
+                    "guard_top_k": sampling["top_k"],
+                },
+            )
+            prompt = self._format_prompt(
+                ref_codes,
+                ref_text,
+                chunks[0],
+                ref_phonemes=ref_phonemes,
+                input_phonemes=chunk_phonemes[0],
+                use_chat_format=self.use_chat_format,
+                emotion_tag=kwargs.get('emotion_tag'),
+            )
             responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
-            wav = self._decode(responses[0].text)
+            output_str = self._apply_generation_guard(
+                logger,
+                chunk_text=chunks[0],
+                chunk_phonemes=chunk_phonemes[0],
+                output_str=responses[0].text,
+                guard=guard,
+            )
+            wav = self._decode(output_str)
+            self._log_generation_result(
+                logger,
+                chunk_index=0,
+                total_chunks=1,
+                chunk_text=chunks[0],
+                chunk_phonemes=chunk_phonemes[0],
+                output_str=output_str,
+                wav=wav,
+            )
             if apply_watermark:
                 wav = self._apply_watermark(wav)
         else:
-            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=False, **kwargs)
+            all_wavs = self.infer_batch(
+                chunks,
+                ref_codes=ref_codes,
+                ref_text=ref_text,
+                voice=voice,
+                temperature=temperature,
+                top_k=top_k,
+                skip_normalize=True,
+                apply_watermark=False,
+                **kwargs,
+            )
             wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
             if apply_watermark:
                 wav = self._apply_watermark(wav)
@@ -155,6 +229,11 @@ class FastVieNeuTTS(BaseVieneuTTS):
         return wav
 
     def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, max_batch_size: Optional[int] = None, **kwargs) -> List[np.ndarray]:
+        texts = self._prepare_texts_for_inference(
+            logger,
+            texts,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             texts = [self.normalizer.normalize(t) for t in texts]
@@ -165,10 +244,47 @@ class FastVieNeuTTS(BaseVieneuTTS):
 
         # Pre-phonemize all for performance
         ref_phonemes = self.get_ref_phonemes(ref_text)
+        self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
         chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+        guards = [
+            self._build_generation_guard(
+                text,
+                phonemes,
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            for text, phonemes in zip(texts, chunk_phonemes)
+        ]
+        samplings = [
+            self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=self.gen_config.repetition_penalty,
+            )
+            for guard in guards
+        ]
+        for i, (text, phonemes) in enumerate(zip(texts, chunk_phonemes)):
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(texts),
+                chunk_text=text,
+                chunk_phonemes=phonemes,
+                extra={
+                    "guard_max_tokens": guards[i]["max_new_tokens"],
+                    "guard_short_text": guards[i]["short_text"],
+                    "guard_compact": guards[i]["repetitive_compact"],
+                    "guard_max_sec": guards[i]["desired_max_duration_s"],
+                    "guard_temp": samplings[i]["temperature"],
+                    "guard_top_k": samplings[i]["top_k"],
+                },
+            )
 
-        self.gen_config.temperature = temperature
-        self.gen_config.top_k = top_k
+        self.gen_config.temperature = min(sampling["temperature"] for sampling in samplings)
+        self.gen_config.top_k = min(sampling["top_k"] for sampling in samplings)
+        self.gen_config.repetition_penalty = max(sampling["repetition_penalty"] for sampling in samplings)
+        self.gen_config.max_new_tokens = max(guard["max_new_tokens"] for guard in guards)
+        self.gen_config.min_new_tokens = min(guard["min_new_tokens"] for guard in guards)
 
         all_wavs = []
         for i in range(0, len(texts), max_batch_size):
@@ -180,7 +296,27 @@ class FastVieNeuTTS(BaseVieneuTTS):
                       for text, ph in zip(batch_texts, batch_phonemes)]
             responses = self.backbone(prompts, gen_config=self.gen_config, do_preprocess=False)
             batch_codes = [response.text for response in responses]
-            batch_wavs = [self._decode(codes) for codes in batch_codes]
+            guarded_outputs = [
+                self._apply_generation_guard(
+                    logger,
+                    chunk_text=chunk_text,
+                    chunk_phonemes=chunk_phoneme,
+                    output_str=output_str,
+                    guard=guards[i + offset],
+                )
+                for offset, (chunk_text, chunk_phoneme, output_str) in enumerate(zip(batch_texts, batch_phonemes, batch_codes))
+            ]
+            batch_wavs = [self._decode(codes) for codes in guarded_outputs]
+            for offset, (chunk_text, chunk_phoneme, output_str, wav) in enumerate(zip(batch_texts, batch_phonemes, guarded_outputs, batch_wavs)):
+                self._log_generation_result(
+                    logger,
+                    chunk_index=i + offset,
+                    total_chunks=len(texts),
+                    chunk_text=chunk_text,
+                    chunk_phonemes=chunk_phoneme,
+                    output_str=output_str,
+                    wav=wav,
+                )
             if apply_watermark:
                 batch_wavs = [self._apply_watermark(w) for w in batch_wavs]
             all_wavs.extend(batch_wavs)
@@ -189,6 +325,11 @@ class FastVieNeuTTS(BaseVieneuTTS):
     def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)

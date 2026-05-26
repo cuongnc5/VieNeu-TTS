@@ -87,7 +87,7 @@ class XPUVieNeuTTS(VieNeuTTS):
 
 
 
-    def _infer_torch(self, prompt_ids: list[int], temperature: float = 1.0, top_k: int = 50) -> str:
+    def _infer_torch(self, prompt_ids: list[int], temperature: float = 1.0, top_k: int = 50, max_new_tokens: int = 512, min_new_tokens: int = 20) -> str:
         """XPU-specific inference using native PyTorch XPU with autocast."""
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to("xpu")
         speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
@@ -98,12 +98,13 @@ class XPUVieNeuTTS(VieNeuTTS):
                 output_tokens = self.backbone.generate(
                     prompt_tensor,
                     max_length=self.max_context,
+                    max_new_tokens=max_new_tokens,
                     eos_token_id=speech_end_id,
                     do_sample=True,
                     temperature=temperature,
                     top_k=top_k,
                     use_cache=True,
-                    min_new_tokens=50,
+                    min_new_tokens=min_new_tokens,
                 )
         
         input_length = prompt_tensor.shape[-1]
@@ -153,13 +154,52 @@ class XPUVieNeuTTS(VieNeuTTS):
         Thực hiện inference theo batch trên XPU sử dụng thuần PyTorch.
         """
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        texts = self._prepare_texts_for_inference(
+            logger,
+            texts,
+            rewrite_enabled=True,
+        )
 
         if not skip_normalize:
             texts = [self.normalizer.normalize(t) for t in texts]
 
         # Pre-phonemize all inputs for performance
         ref_phonemes = self.get_ref_phonemes(ref_text)
+        self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
         chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+        guards = [
+            self._build_generation_guard(
+                text,
+                phonemes,
+                requested_max_new_tokens=None,
+            )
+            for text, phonemes in zip(texts, chunk_phonemes)
+        ]
+        samplings = [
+            self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.10,
+            )
+            for guard in guards
+        ]
+        for i, (text, phonemes) in enumerate(zip(texts, chunk_phonemes)):
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(texts),
+                chunk_text=text,
+                chunk_phonemes=phonemes,
+                extra={
+                    "guard_max_tokens": guards[i]["max_new_tokens"],
+                    "guard_short_text": guards[i]["short_text"],
+                    "guard_compact": guards[i]["repetitive_compact"],
+                    "guard_max_sec": guards[i]["desired_max_duration_s"],
+                    "guard_temp": samplings[i]["temperature"],
+                    "guard_top_k": samplings[i]["top_k"],
+                },
+            )
 
         # Prepare prompt for each chunk in batch
         batch_prompt_ids = []
@@ -183,10 +223,12 @@ class XPUVieNeuTTS(VieNeuTTS):
                     max_length=self.max_context,
                     eos_token_id=speech_end_id,
                     do_sample=True,
-                    temperature=temperature,
-                    top_k=top_k,
+                    temperature=min(sampling["temperature"] for sampling in samplings),
+                    top_k=min(sampling["top_k"] for sampling in samplings),
                     use_cache=True,
-                    min_new_tokens=50,
+                    max_new_tokens=max(guard["max_new_tokens"] for guard in guards),
+                    min_new_tokens=min(guard["min_new_tokens"] for guard in guards),
+                    repetition_penalty=max(sampling["repetition_penalty"] for sampling in samplings),
                 )
 
         # Batch Decoding
@@ -196,7 +238,23 @@ class XPUVieNeuTTS(VieNeuTTS):
         for i in range(len(texts)):
             generated_ids = output_tokens[i, input_length:]
             output_str = self.tokenizer.decode(generated_ids, add_special_tokens=False)
+            output_str = self._apply_generation_guard(
+                logger,
+                chunk_text=texts[i],
+                chunk_phonemes=chunk_phonemes[i],
+                output_str=output_str,
+                guard=guards[i],
+            )
             wav = self._decode(output_str)
+            self._log_generation_result(
+                logger,
+                chunk_index=i,
+                total_chunks=len(texts),
+                chunk_text=texts[i],
+                chunk_phonemes=chunk_phonemes[i],
+                output_str=output_str,
+                wav=wav,
+            )
             
             if apply_watermark:
                 wav = self._apply_watermark(wav)

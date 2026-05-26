@@ -1503,6 +1503,9 @@ def generate_vtt_dubbing_ui(
     overflow_mode,
     max_speedup,
     worker_threads,
+    auto_avoid_overlap,
+    overlap_safety_margin_ms,
+    max_shift_ms,
     *args
 ):
     global tts, model_loaded, current_backbone
@@ -1565,6 +1568,9 @@ def generate_vtt_dubbing_ui(
                 overflow_mode=overflow_mode,
                 max_speedup=float(max_speedup),
                 worker_count=int(worker_threads),
+                auto_avoid_overlap=bool(auto_avoid_overlap),
+                overlap_safety_margin_ms=float(overlap_safety_margin_ms),
+                max_shift_ms=(None if max_shift_ms in (None, "") or float(max_shift_ms) <= 0 else float(max_shift_ms)),
                 speakers=speaker_names,
                 voice_ids=speaker_voices,
                 reference_audio_paths=speaker_ref_audios,
@@ -2141,6 +2147,25 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                                 label="Worker Threads",
                             )
 
+                        with gr.Row():
+                            vtt_auto_avoid_overlap = gr.Checkbox(
+                                value=False,
+                                label="Auto avoid overlap",
+                                info="Khi bật, hệ thống chỉ dịch thời điểm đặt cue audio để giảm overlap ngoài ý muốn; không sửa file VTT gốc.",
+                            )
+                            vtt_overlap_safety_margin_ms = gr.Slider(
+                                minimum=0,
+                                maximum=500,
+                                value=100,
+                                step=10,
+                                label="Overlap Safety Margin (ms)",
+                            )
+                            vtt_max_overlap_shift_ms = gr.Number(
+                                value=0,
+                                label="Max Shift (ms, 0 = no cap)",
+                                precision=0,
+                            )
+
                         vtt_mode_runtime_note = gr.Markdown("Mode hiện hành: chưa tải model.")
 
                         vtt_status_output = gr.Textbox(
@@ -2395,6 +2420,9 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 vtt_overflow_mode,
                 vtt_max_speedup,
                 vtt_worker_threads,
+                vtt_auto_avoid_overlap,
+                vtt_overlap_safety_margin_ms,
+                vtt_max_overlap_shift_ms,
                 *vtt_speaker_name_boxes,
                 *vtt_voice_dds,
                 *vtt_ref_audio_inputs,

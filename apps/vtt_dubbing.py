@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -18,16 +18,27 @@ import unicodedata
 
 import numpy as np
 import soundfile as sf
+from vieneu.logging_utils import get_vtt_generation_log_path
+from vieneu.text_safety import (
+    ShortCueRewritePlan,
+    normalize_short_text_for_safety as normalize_short_timing_text,
+    rewrite_problematic_short_cue,
+)
 
 
 MAX_VTT_SPEAKERS = 16
 DEFAULT_SAMPLE_RATE = 24_000
 CUE_TIMING_TOLERANCE_SECONDS = 0.01
-VTT_CACHE_SCHEMA_VERSION = 2
+VTT_CACHE_SCHEMA_VERSION = 4
+FFMPEG_TIMELINE_COMPOSE_MAX_INPUTS = 256
+MEMMAP_COMPOSE_WRITE_CHUNK_SECONDS = 60
+MEMMAP_COMPOSE_LOG_INTERVAL = 100
+PROTECTED_SHORT_TEXT_MAX_WORDS = 3
+DEFAULT_OVERLAP_SAFETY_MARGIN_MS = 100.0
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "vtt"
 TEMP_AUDIO_DIR = OUTPUT_ROOT / "temp" / "audio"
-LOG_FILE_PATH = OUTPUT_ROOT / "logs" / "vtt_generation.log"
+LOG_FILE_PATH = get_vtt_generation_log_path()
 SPEAKER_EXPORT_PATH = OUTPUT_ROOT / "speakers_detected.json"
 SUPPORTED_REFERENCE_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 SUPPORTED_VIDEO_SUFFIXES = {".mp4"}
@@ -39,6 +50,49 @@ SUPPORTED_SUBTITLE_EXPORT_MODES = {
     SUBTITLE_EXPORT_BURN,
     SUBTITLE_EXPORT_SOFT,
 }
+RISKY_SHORT_CUE_PHRASES = (
+    "vâng",
+    "dạ",
+    "ạ",
+    "dạ vâng",
+    "vâng ạ",
+    "dạ ạ",
+    "ừ",
+    "ờ",
+    "ừm",
+    "ờm",
+    "à",
+    "À",
+    "á",
+    "hả",
+    "hử",
+    "hở",
+    "sao",
+    "gì",
+    "ai",
+    "đâu",
+    "không",
+    "có",
+    "đúng",
+    "rồi",
+    "được",
+    "thôi",
+    "nào",
+    "đi",
+    "chứ",
+    "vậy",
+    "nhé",
+    "nha",
+    "nhỉ",
+    "ha",
+    "hen",
+    "ơi",
+    "ôi",
+    "ui",
+    "trời",
+    "alo",
+    "ok",
+)
 
 VOICE_TAG_PATTERN = re.compile(r"^\s*<v\s+([^>]+)>(.*?)</v>\s*$", re.IGNORECASE | re.DOTALL)
 BRACKET_SPEAKER_PATTERN = re.compile(r"^\s*\[([^\]]+)\]\s*(.*)$", re.DOTALL)
@@ -78,6 +132,10 @@ class CueRenderResult:
     audio_path: Optional[Path]
     duration_seconds: float
     skipped: bool = False
+    placement_start_seconds: Optional[float] = None
+    overlap_detected: bool = False
+    shift_applied_ms: float = 0.0
+    auto_avoid_overlap_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +161,14 @@ class CueTimingPlan:
             abs(self.duration_delta) > CUE_TIMING_TOLERANCE_SECONDS
             and abs(self.applied_ratio - 1.0) > 1e-6
         )
+
+
+@dataclass(frozen=True)
+class ShortTextProtectionPlan:
+    normalized_text: str
+    word_count: int
+    risky_phrase_match: bool
+    protected_short_text: bool
 
 
 class RunLogger:
@@ -138,14 +204,19 @@ class RunLogger:
             return "\n".join(self._messages[-400:])
 
 
+def resolve_log_file_path(output_root: Path = OUTPUT_ROOT) -> Path:
+    candidate_root = Path(output_root)
+    return LOG_FILE_PATH if candidate_root.resolve() == OUTPUT_ROOT.resolve() else candidate_root / "logs" / "vtt_generation.log"
+
+
 def ensure_output_tree(output_root: Path = OUTPUT_ROOT) -> None:
     (output_root / "temp" / "audio").mkdir(parents=True, exist_ok=True)
-    (output_root / "logs").mkdir(parents=True, exist_ok=True)
+    resolve_log_file_path(output_root).parent.mkdir(parents=True, exist_ok=True)
 
 
 def append_log_line(message: str, output_root: Path = OUTPUT_ROOT, reset: bool = False) -> None:
     ensure_output_tree(output_root)
-    logger = RunLogger(output_root / "logs" / "vtt_generation.log", reset=reset)
+    logger = RunLogger(resolve_log_file_path(output_root), reset=reset)
     logger.info(message)
 
 
@@ -218,7 +289,25 @@ def strip_vtt_markup(text: str) -> str:
     text = TAG_PATTERN.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
 
+NORMALIZED_RISKY_SHORT_CUE_PHRASES = {
+    normalize_short_timing_text(phrase) for phrase in RISKY_SHORT_CUE_PHRASES
+}
 
+
+def analyze_short_text_protection(text: str) -> ShortTextProtectionPlan:
+    normalized_text = normalize_short_timing_text(text)
+    words = normalized_text.split() if normalized_text else []
+    word_count = len(words)
+    risky_phrase_match = normalized_text in NORMALIZED_RISKY_SHORT_CUE_PHRASES
+    protected_short_text = bool(normalized_text) and (
+        word_count <= PROTECTED_SHORT_TEXT_MAX_WORDS or risky_phrase_match
+    )
+    return ShortTextProtectionPlan(
+        normalized_text=normalized_text,
+        word_count=word_count,
+        risky_phrase_match=risky_phrase_match,
+        protected_short_text=protected_short_text,
+    )
 def split_speaker_prefix(line: str) -> Optional[tuple[str, str]]:
     stripped = line.strip()
     for separator in SPEAKER_SEPARATORS:
@@ -468,14 +557,18 @@ def ensure_ffmpeg(ffmpeg_path: str) -> None:
 
 def run_command(command: list[str], logger: RunLogger, error_context: str) -> None:
     logger.info(f"Chạy lệnh: {' '.join(command)}")
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        logger.error(f"{error_context}: {exc}")
+        raise VTTDubbingError(f"{error_context}: {exc}") from exc
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or completed.stdout.strip() or "Không có stderr."
         logger.error(f"{error_context}: {stderr}")
@@ -484,14 +577,18 @@ def run_command(command: list[str], logger: RunLogger, error_context: str) -> No
 
 def run_command_capture_output(command: list[str], logger: RunLogger, error_context: str) -> str:
     logger.info(f"Chạy lệnh: {' '.join(command)}")
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        logger.error(f"{error_context}: {exc}")
+        raise VTTDubbingError(f"{error_context}: {exc}") from exc
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or completed.stdout.strip() or "Không có stderr."
         logger.error(f"{error_context}: {stderr}")
@@ -601,6 +698,30 @@ def truncate_audio_with_ffmpeg(
     run_command(command, logger, f"FFmpeg truncate thất bại cho {input_path.name}")
 
 
+def pad_audio_with_silence(
+    input_path: Path,
+    output_path: Path,
+    target_duration: float,
+    logger: RunLogger,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> None:
+    if target_duration <= 0:
+        raise VTTDubbingError("Target duration để pad silence phải lớn hơn 0.")
+
+    audio = read_audio_mono_float32(input_path, sample_rate)
+    target_samples = max(audio.shape[0], int(round(target_duration * sample_rate)))
+    if target_samples == audio.shape[0]:
+        finalize_audio_file(input_path, output_path)
+        return
+
+    padding_samples = target_samples - audio.shape[0]
+    padded_audio = np.pad(audio, (0, padding_samples), mode="constant")
+    sf.write(str(output_path), padded_audio, sample_rate)
+    logger.info(
+        f"Pad silence cho {input_path.name}: +{padding_samples / sample_rate:.2f}s để khớp target={target_duration:.2f}s"
+    )
+
+
 def safe_unlink(path: Path) -> None:
     try:
         if path.exists():
@@ -615,6 +736,36 @@ def safe_rmtree(path: Path) -> None:
             shutil.rmtree(path, ignore_errors=True)
     except OSError:
         pass
+
+
+def calculate_timeline_duration(rendered_cues: list[CueRenderResult]) -> float:
+    total_duration = max(item.cue.end_seconds for item in rendered_cues)
+    for item in rendered_cues:
+        if item.audio_path is None:
+            continue
+        total_duration = max(total_duration, get_rendered_start_seconds(item) + item.duration_seconds)
+    return total_duration + 0.05
+
+
+def get_rendered_start_seconds(rendered: CueRenderResult) -> float:
+    if rendered.placement_start_seconds is not None:
+        return rendered.placement_start_seconds
+    return rendered.cue.start_seconds
+
+
+def get_rendered_end_seconds(rendered: CueRenderResult) -> float:
+    return get_rendered_start_seconds(rendered) + rendered.duration_seconds
+
+
+def read_audio_mono_float32(audio_path: Path, sample_rate: int) -> np.ndarray:
+    audio, detected_sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=True)
+    if detected_sample_rate != sample_rate:
+        raise VTTDubbingError(
+            f"Cue audio '{audio_path.name}' có sample rate {detected_sample_rate}, mong đợi {sample_rate}."
+        )
+    if audio.shape[1] == 1:
+        return np.ascontiguousarray(audio[:, 0], dtype=np.float32)
+    return np.ascontiguousarray(audio.mean(axis=1), dtype=np.float32)
 
 
 def resolve_ffprobe_binary(ffmpeg_path: str) -> str:
@@ -796,12 +947,19 @@ def build_cache_payload(
     emotion: str,
     overflow_mode: str,
     max_speedup: float,
+    dubbed_text: Optional[str] = None,
+    rewrite_reason: str = "",
 ) -> dict[str, Any]:
+    effective_text = dubbed_text if dubbed_text is not None else cue.text
+    short_text_plan = analyze_short_text_protection(effective_text)
     return {
         "cache_schema_version": VTT_CACHE_SCHEMA_VERSION,
         "cue_index": cue.index,
         "speaker": cue.speaker,
         "text": cue.text,
+        "dubbed_text": effective_text,
+        "rewrite_reason": rewrite_reason,
+        "normalized_text": short_text_plan.normalized_text,
         "start_seconds": round(cue.start_seconds, 3),
         "end_seconds": round(cue.end_seconds, 3),
         "mode": selected_mode,
@@ -811,7 +969,8 @@ def build_cache_payload(
         "source_label": assignment.source_label,
         "source_signature": assignment.source_signature,
         "speed": round(assignment.speed, 4),
-        "cue_timing_strategy": "base_speed_plus_measured_auto_fit",
+        "protected_short_text": short_text_plan.protected_short_text,
+        "cue_timing_strategy": "base_speed_plus_measured_auto_fit_with_short_text_protection",
         "sample_rate": DEFAULT_SAMPLE_RATE,
     }
 
@@ -820,9 +979,74 @@ def read_cached_payload(meta_path: Path) -> Optional[dict[str, Any]]:
     if not meta_path.exists():
         return None
     try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+    if isinstance(payload, dict) and isinstance(payload.get("cache_key"), dict):
+        return payload["cache_key"]
+    return payload if isinstance(payload, dict) else None
+
+
+def build_cue_timing_metadata(
+    *,
+    cue: VTTCue,
+    assignment: SpeakerAssignment,
+    short_text_plan: ShortTextProtectionPlan,
+    dubbed_text: str,
+    rewrite_plan: ShortCueRewritePlan,
+    raw_duration: float,
+    duration_after_base_speed: float,
+    final_duration: float,
+    effective_base_speed: float,
+    final_speed: float,
+    timing_plan: CueTimingPlan,
+    auto_fit_applied: bool,
+    overflow_speed_ratio: Optional[float],
+    overflow_truncated: bool,
+    silence_padding_seconds: float,
+) -> dict[str, Any]:
+    timing_actions: list[str] = []
+    if short_text_plan.protected_short_text and assignment.speed < 1.0 and effective_base_speed >= 1.0:
+        timing_actions.append("protected_skip_base_slowdown")
+    if auto_fit_applied:
+        timing_actions.append("auto_fit")
+    if overflow_speed_ratio is not None:
+        timing_actions.append("overflow_speedup")
+    if overflow_truncated:
+        timing_actions.append("overflow_truncate")
+    if silence_padding_seconds > CUE_TIMING_TOLERANCE_SECONDS:
+        timing_actions.append("silence_padding")
+    if not timing_actions:
+        timing_actions.append("none")
+
+    return {
+        "cue_index": cue.index,
+        "speaker": cue.speaker,
+        "original_text": cue.text,
+        "dubbed_text": dubbed_text,
+        "rewrite_applied": rewrite_plan.applied,
+        "rewrite_reason": rewrite_plan.reason,
+        "target_duration": round(cue.duration, 4),
+        "raw_generated_duration": round(raw_duration, 4),
+        "duration_after_base_speed": round(duration_after_base_speed, 4),
+        "final_duration": round(final_duration, 4),
+        "base_speaker_speed": round(assignment.speed, 4),
+        "effective_base_speed": round(effective_base_speed, 4),
+        "final_speed": round(final_speed, 4),
+        "speed_ratio_required": round(timing_plan.required_ratio, 4),
+        "speed_ratio_applied": round(timing_plan.applied_ratio if auto_fit_applied else 1.0, 4),
+        "protected_short_text": short_text_plan.protected_short_text,
+        "protected_short_text_reason": (
+            "word_count<=3" if short_text_plan.word_count <= PROTECTED_SHORT_TEXT_MAX_WORDS else "risky_phrase_match"
+        ) if short_text_plan.protected_short_text else "",
+        "normalized_text": short_text_plan.normalized_text,
+        "word_count": short_text_plan.word_count,
+        "risky_phrase_match": short_text_plan.risky_phrase_match,
+        "overflow_speed_ratio": round(overflow_speed_ratio, 4) if overflow_speed_ratio is not None else None,
+        "overflow_truncated": overflow_truncated,
+        "silence_padding_seconds": round(silence_padding_seconds, 4),
+        "timing_actions": timing_actions,
+    }
 
 
 def finalize_audio_file(source_path: Path, target_path: Path) -> None:
@@ -855,26 +1079,45 @@ def render_single_cue(
     base_speed_path = temp_audio_dir / f"cue_{cue.index:06d}__{safe_speaker}__base.wav"
     auto_fit_path = temp_audio_dir / f"cue_{cue.index:06d}__{safe_speaker}__autofit.wav"
     overflow_path = temp_audio_dir / f"cue_{cue.index:06d}__{safe_speaker}__overflow.wav"
+    padded_path = temp_audio_dir / f"cue_{cue.index:06d}__{safe_speaker}__padded.wav"
 
-    cache_payload = build_cache_payload(cue, assignment, selected_mode, emotion, overflow_mode, max_speedup)
+    rewrite_plan = rewrite_problematic_short_cue(cue.text)
+    dubbed_text = rewrite_plan.rewritten_text if rewrite_plan.applied else cue.text
+    cache_payload = build_cache_payload(
+        cue,
+        assignment,
+        selected_mode,
+        emotion,
+        overflow_mode,
+        max_speedup,
+        dubbed_text=dubbed_text,
+        rewrite_reason=rewrite_plan.reason,
+    )
     cached_payload = read_cached_payload(meta_path)
     if final_path.exists() and cached_payload == cache_payload:
         duration = get_audio_duration(final_path)
         logger.info(f"Cache hit cho cue {cue.index}: {final_path.name}")
         return CueRenderResult(cue=cue, audio_path=final_path, duration_seconds=duration, skipped=False)
 
-    for staged_path in (final_path, raw_path, base_speed_path, auto_fit_path, overflow_path):
+    for staged_path in (final_path, raw_path, base_speed_path, auto_fit_path, overflow_path, padded_path):
         safe_unlink(staged_path)
 
+    short_text_plan = analyze_short_text_protection(dubbed_text)
     emotion_tag = "<|emotion_0|>" if emotion == "natural" and selected_mode == "standard" else None
+    if rewrite_plan.applied:
+        logger.info(
+            f"Cue {cue.index}: rewrite short cue trước khi dubbing: {cue.text!r} -> {dubbed_text!r} "
+            f"(reason={rewrite_plan.reason})"
+        )
 
     # Shared TTS instances inside VieNeu-TTS are not guaranteed to be thread-safe across backends.
     # We keep parallelism at the job level, but serialize infer()/encode_reference() through a lock.
     with tts_lock:
         audio = tts_engine.infer(
-            cue.text,
+            dubbed_text,
             voice=assignment.voice_data,
             emotion_tag=emotion_tag,
+            target_duration=cue.duration,
             apply_watermark=True,
         )
 
@@ -884,31 +1127,52 @@ def render_single_cue(
     tts_engine.save(audio, raw_path)
     current_path = raw_path
     current_duration = get_audio_duration(current_path)
+    raw_duration = current_duration
+    effective_base_speed = assignment.speed
+    auto_fit_applied = False
+    overflow_speed_ratio: Optional[float] = None
+    overflow_truncated = False
+    silence_padding_seconds = 0.0
 
-    if abs(assignment.speed - 1.0) > 1e-6:
-        apply_speed_with_ffmpeg(ffmpeg_path, current_path, base_speed_path, assignment.speed, logger)
+    if short_text_plan.protected_short_text and effective_base_speed < 1.0:
+        logger.info(
+            f"Cue {cue.index}: protected_short_text=true, bỏ qua speaker speed chậm {effective_base_speed:.2f}x "
+            f"để tránh kéo dài '{dubbed_text}'."
+        )
+        effective_base_speed = 1.0
+
+    if abs(effective_base_speed - 1.0) > 1e-6:
+        apply_speed_with_ffmpeg(ffmpeg_path, current_path, base_speed_path, effective_base_speed, logger)
         current_path = base_speed_path
         current_duration = get_audio_duration(current_path)
         logger.info(
-            f"Cue {cue.index}: áp dụng speaker speed nền {assignment.speed:.2f} cho '{cue.speaker}', duration={current_duration:.2f}s"
+            f"Cue {cue.index}: áp dụng speaker speed nền {effective_base_speed:.2f} cho '{cue.speaker}', duration={current_duration:.2f}s"
         )
 
+    duration_after_base_speed = current_duration
     timing_plan = plan_cue_timing_adjustment(current_duration, cue.duration, max_speedup)
     if timing_plan.needs_adjustment:
-        apply_speed_with_ffmpeg(ffmpeg_path, current_path, auto_fit_path, timing_plan.applied_ratio, logger)
-        current_path = auto_fit_path
-        current_duration = get_audio_duration(current_path)
-        if timing_plan.was_clamped:
-            logger.warning(
-                f"Cue {cue.index}: auto-fit timing dùng ratio {timing_plan.applied_ratio:.2f}x "
-                f"(yêu cầu {timing_plan.required_ratio:.2f}x, giới hạn tự nhiên {timing_plan.min_ratio:.2f}x-{timing_plan.max_ratio:.2f}x), "
-                f"duration={current_duration:.2f}s / target={cue.duration:.2f}s"
+        if short_text_plan.protected_short_text and timing_plan.applied_ratio < 1.0:
+            logger.info(
+                f"Cue {cue.index}: protected_short_text=true, giữ nguyên nhịp tự nhiên cho '{dubbed_text}' "
+                f"thay vì slow-down từ {current_duration:.2f}s lên target {cue.duration:.2f}s."
             )
         else:
-            logger.info(
-                f"Cue {cue.index}: auto-fit timing với ratio {timing_plan.applied_ratio:.2f}x, "
-                f"duration={current_duration:.2f}s / target={cue.duration:.2f}s"
-            )
+            apply_speed_with_ffmpeg(ffmpeg_path, current_path, auto_fit_path, timing_plan.applied_ratio, logger)
+            current_path = auto_fit_path
+            current_duration = get_audio_duration(current_path)
+            auto_fit_applied = True
+            if timing_plan.was_clamped:
+                logger.warning(
+                    f"Cue {cue.index}: auto-fit timing dùng ratio {timing_plan.applied_ratio:.2f}x "
+                    f"(yêu cầu {timing_plan.required_ratio:.2f}x, giới hạn tự nhiên {timing_plan.min_ratio:.2f}x-{timing_plan.max_ratio:.2f}x), "
+                    f"duration={current_duration:.2f}s / target={cue.duration:.2f}s"
+                )
+            else:
+                logger.info(
+                    f"Cue {cue.index}: auto-fit timing với ratio {timing_plan.applied_ratio:.2f}x, "
+                    f"duration={current_duration:.2f}s / target={cue.duration:.2f}s"
+                )
 
     if current_duration > cue.duration + CUE_TIMING_TOLERANCE_SECONDS:
         if overflow_mode == "speedup":
@@ -917,6 +1181,7 @@ def render_single_cue(
                 apply_speed_with_ffmpeg(ffmpeg_path, current_path, overflow_path, speed_ratio, logger)
                 current_path = overflow_path
                 current_duration = get_audio_duration(current_path)
+                overflow_speed_ratio = speed_ratio
                 logger.warning(
                     f"Cue {cue.index}: vẫn vượt subtitle sau auto-fit tự nhiên, tăng tốc thêm {speed_ratio:.2f}x theo overflow_mode=speedup"
                 )
@@ -924,36 +1189,191 @@ def render_single_cue(
             truncate_audio_with_ffmpeg(ffmpeg_path, current_path, overflow_path, cue.duration, logger)
             current_path = overflow_path
             current_duration = get_audio_duration(current_path)
+            overflow_truncated = True
             logger.warning(f"Cue {cue.index}: vẫn vượt subtitle sau auto-fit, đã truncate theo overflow_mode=truncate")
         else:
             logger.warning(f"Cue {cue.index}: vẫn vượt subtitle sau auto-fit nhưng giữ nguyên theo overflow_mode=keep")
 
-    finalize_audio_file(current_path, final_path)
-    meta_path.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if short_text_plan.protected_short_text and current_duration < cue.duration - CUE_TIMING_TOLERANCE_SECONDS:
+        silence_padding_seconds = cue.duration - current_duration
+        pad_audio_with_silence(current_path, padded_path, cue.duration, logger)
+        current_path = padded_path
+        current_duration = get_audio_duration(current_path)
+        logger.info(
+            f"Cue {cue.index}: protected_short_text=true, giữ audio tự nhiên và pad silence "
+            f"{silence_padding_seconds:.2f}s để khớp target={cue.duration:.2f}s"
+        )
 
-    for staged_path in (raw_path, base_speed_path, auto_fit_path, overflow_path):
+    finalize_audio_file(current_path, final_path)
+    final_speed = effective_base_speed
+    if auto_fit_applied:
+        final_speed *= timing_plan.applied_ratio
+    if overflow_speed_ratio is not None:
+        final_speed *= overflow_speed_ratio
+    if short_text_plan.protected_short_text:
+        final_speed = max(1.0, final_speed)
+
+    cue_timing_metadata = build_cue_timing_metadata(
+        cue=cue,
+        assignment=assignment,
+        short_text_plan=short_text_plan,
+        dubbed_text=dubbed_text,
+        rewrite_plan=rewrite_plan,
+        raw_duration=raw_duration,
+        duration_after_base_speed=duration_after_base_speed,
+        final_duration=current_duration,
+        effective_base_speed=effective_base_speed,
+        final_speed=final_speed,
+        timing_plan=timing_plan,
+        auto_fit_applied=auto_fit_applied,
+        overflow_speed_ratio=overflow_speed_ratio,
+        overflow_truncated=overflow_truncated,
+        silence_padding_seconds=silence_padding_seconds,
+    )
+    meta_payload = {
+        "cache_key": cache_payload,
+        "cue_timing": cue_timing_metadata,
+    }
+    meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    for staged_path in (raw_path, base_speed_path, auto_fit_path, overflow_path, padded_path):
         if staged_path != final_path:
             safe_unlink(staged_path)
 
     return CueRenderResult(cue=cue, audio_path=final_path, duration_seconds=current_duration, skipped=False)
 
 
-def compose_with_ffmpeg(
+def apply_auto_overlap_avoidance(
+    rendered_cues: list[CueRenderResult],
+    *,
+    auto_avoid_overlap: bool,
+    overlap_safety_margin_ms: float,
+    max_shift_ms: Optional[float],
+    logger: RunLogger,
+) -> list[CueRenderResult]:
+    if overlap_safety_margin_ms < 0:
+        raise VTTDubbingError("overlap_safety_margin_ms phải lớn hơn hoặc bằng 0.")
+    if max_shift_ms is not None and max_shift_ms < 0:
+        raise VTTDubbingError("max_shift_ms phải lớn hơn hoặc bằng 0 nếu được cấu hình.")
+
+    safety_margin_seconds = overlap_safety_margin_ms / 1000.0
+    max_shift_seconds = None if max_shift_ms is None else max_shift_ms / 1000.0
+    adjusted_results: list[CueRenderResult] = []
+
+    previous_end_seconds: Optional[float] = None
+    for rendered in rendered_cues:
+        original_start = rendered.cue.start_seconds
+        adjusted_start = original_start
+        overlap_detected = False
+        shift_applied_seconds = 0.0
+        required_shift_seconds = 0.0
+
+        if auto_avoid_overlap and previous_end_seconds is not None:
+            minimum_start = previous_end_seconds + safety_margin_seconds
+            if minimum_start > original_start + 1e-9:
+                overlap_detected = True
+                required_shift_seconds = minimum_start - original_start
+                shift_applied_seconds = (
+                    required_shift_seconds
+                    if max_shift_seconds is None
+                    else min(required_shift_seconds, max_shift_seconds)
+                )
+                adjusted_start = original_start + shift_applied_seconds
+
+        adjusted = replace(
+            rendered,
+            placement_start_seconds=adjusted_start,
+            overlap_detected=overlap_detected,
+            shift_applied_ms=shift_applied_seconds * 1000.0,
+            auto_avoid_overlap_enabled=auto_avoid_overlap,
+        )
+        adjusted_results.append(adjusted)
+        previous_end_seconds = get_rendered_end_seconds(adjusted)
+
+        logger.info(
+            f"Cue {rendered.cue.index} placement: original_start={original_start:.3f}s "
+            f"adjusted_start={adjusted_start:.3f}s audio_duration={rendered.duration_seconds:.3f}s "
+            f"overlap_detected={'true' if overlap_detected else 'false'} "
+            f"shift_applied_ms={shift_applied_seconds * 1000.0:.1f} "
+            f"auto_avoid_overlap_enabled={'true' if auto_avoid_overlap else 'false'}"
+        )
+        if overlap_detected and max_shift_seconds is not None and shift_applied_seconds + 1e-9 < required_shift_seconds:
+            remaining_shift_ms = (required_shift_seconds - shift_applied_seconds) * 1000.0
+            logger.warning(
+                f"Cue {rendered.cue.index}: overlap avoidance chạm max_shift_ms={max_shift_ms:.1f}, "
+                f"vẫn còn overlap khoảng {remaining_shift_ms:.1f}ms."
+            )
+
+    return adjusted_results
+
+
+def compose_with_memmap(
+    rendered_cues: list[CueRenderResult],
+    output_path: Path,
+    logger: RunLogger,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> Path:
+    total_duration = calculate_timeline_duration(rendered_cues)
+    total_samples = max(1, int(np.ceil(total_duration * sample_rate)))
+    chunk_samples = sample_rate * MEMMAP_COMPOSE_WRITE_CHUNK_SECONDS
+    temp_mix_path = output_path.parent / "temp" / f"{output_path.stem}__timeline.f32"
+    temp_mix_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_unlink(output_path)
+    safe_unlink(temp_mix_path)
+
+    logger.info(
+        f"Compose fallback nội bộ: mix {len(rendered_cues)} cue vào buffer {total_duration:.2f}s "
+        f"({total_samples} samples) để tránh lệnh FFmpeg quá lớn."
+    )
+
+    timeline: Optional[np.memmap] = None
+    try:
+        timeline = np.memmap(temp_mix_path, dtype=np.float32, mode="w+", shape=(total_samples,))
+        timeline[:] = 0.0
+
+        for index, rendered in enumerate(rendered_cues, start=1):
+            if rendered.audio_path is None:
+                continue
+            audio = read_audio_mono_float32(rendered.audio_path, sample_rate)
+            if audio.size == 0:
+                continue
+            start_sample = max(0, int(round(get_rendered_start_seconds(rendered) * sample_rate)))
+            end_sample = min(total_samples, start_sample + audio.shape[0])
+            if end_sample <= start_sample:
+                continue
+            timeline[start_sample:end_sample] += audio[: end_sample - start_sample]
+            if index % MEMMAP_COMPOSE_LOG_INTERVAL == 0 or index == len(rendered_cues):
+                logger.info(f"Compose fallback nội bộ: đã mix {index}/{len(rendered_cues)} cue")
+
+        np.clip(timeline, -1.0, 1.0, out=timeline)
+        timeline.flush()
+
+        with sf.SoundFile(
+            str(output_path),
+            mode="w",
+            samplerate=sample_rate,
+            channels=1,
+            subtype="PCM_16",
+        ) as output_handle:
+            for start_sample in range(0, total_samples, chunk_samples):
+                stop_sample = min(total_samples, start_sample + chunk_samples)
+                output_handle.write(np.asarray(timeline[start_sample:stop_sample], dtype=np.float32))
+    finally:
+        if timeline is not None:
+            del timeline
+        safe_unlink(temp_mix_path)
+
+    return output_path
+
+
+def compose_with_ffmpeg_filtergraph(
     rendered_cues: list[CueRenderResult],
     output_path: Path,
     ffmpeg_path: str,
     logger: RunLogger,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
 ) -> Path:
-    audio_cues = [item for item in rendered_cues if item.audio_path is not None]
-    if not audio_cues:
-        raise VTTDubbingError("Không có cue audio hợp lệ để ghép timeline.")
-
-    total_duration = max(item.cue.end_seconds for item in rendered_cues)
-    for item in audio_cues:
-        total_duration = max(total_duration, item.cue.start_seconds + item.duration_seconds)
-    total_duration += 0.05
-
+    total_duration = calculate_timeline_duration(rendered_cues)
     command = [
         ffmpeg_path,
         "-y",
@@ -970,9 +1390,9 @@ def compose_with_ffmpeg(
 
     filter_steps: list[str] = []
     mix_inputs = ["[0:a]"]
-    for input_index, rendered in enumerate(audio_cues, start=1):
+    for input_index, rendered in enumerate(rendered_cues, start=1):
         command.extend(["-i", str(rendered.audio_path)])
-        delay_ms = max(0, int(round(rendered.cue.start_seconds * 1000)))
+        delay_ms = max(0, int(round(get_rendered_start_seconds(rendered) * 1000)))
         label = f"dub{input_index}"
         filter_steps.append(f"[{input_index}:a]adelay={delay_ms}|{delay_ms}[{label}]")
         mix_inputs.append(f"[{label}]")
@@ -996,6 +1416,27 @@ def compose_with_ffmpeg(
 
     run_command(command, logger, "FFmpeg ghép timeline thất bại")
     return output_path
+
+
+def compose_with_ffmpeg(
+    rendered_cues: list[CueRenderResult],
+    output_path: Path,
+    ffmpeg_path: str,
+    logger: RunLogger,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> Path:
+    audio_cues = [item for item in rendered_cues if item.audio_path is not None]
+    if not audio_cues:
+        raise VTTDubbingError("Không có cue audio hợp lệ để ghép timeline.")
+
+    if len(audio_cues) > FFMPEG_TIMELINE_COMPOSE_MAX_INPUTS:
+        logger.warning(
+            f"Số cue audio quá lớn ({len(audio_cues)} input). "
+            "Chuyển sang compose fallback nội bộ để tránh nghẽn FFmpeg ở bước mix cuối."
+        )
+        return compose_with_memmap(audio_cues, output_path, logger, sample_rate=sample_rate)
+
+    return compose_with_ffmpeg_filtergraph(audio_cues, output_path, ffmpeg_path, logger, sample_rate=sample_rate)
 
 
 def mux_dubbed_audio_into_video(
@@ -1182,11 +1623,13 @@ def cleanup_vtt_artifacts(
     keep_paths: Optional[list[Path]] = None,
 ) -> None:
     keep_resolved = {path.resolve() for path in (keep_paths or []) if path.exists()}
+    log_dir = resolve_log_file_path(output_root).parent
     cleanup_candidates = [
         output_root / "temp",
-        output_root / "logs",
         output_root / "speakers_detected.json",
     ]
+    if log_dir.resolve().is_relative_to(output_root.resolve()):
+        cleanup_candidates.append(log_dir)
 
     for candidate in cleanup_candidates:
         if candidate.resolve() in keep_resolved:
@@ -1196,7 +1639,11 @@ def cleanup_vtt_artifacts(
             continue
         safe_unlink(candidate)
 
-    for candidate in (output_root / "temp", output_root / "logs"):
+    cleanup_dirs = [output_root / "temp"]
+    if log_dir.resolve().is_relative_to(output_root.resolve()):
+        cleanup_dirs.append(log_dir)
+
+    for candidate in cleanup_dirs:
         try:
             if candidate.exists() and not any(candidate.iterdir()):
                 candidate.rmdir()
@@ -1220,6 +1667,9 @@ def generate_vtt_dubbing(
     reference_texts: list[Any],
     speeds: list[Any],
     logger: RunLogger,
+    auto_avoid_overlap: bool = False,
+    overlap_safety_margin_ms: float = DEFAULT_OVERLAP_SAFETY_MARGIN_MS,
+    max_shift_ms: Optional[float] = None,
     subtitle_export_mode: str = SUBTITLE_EXPORT_NONE,
     status_callback: Optional[Callable[[str], None]] = None,
     ffmpeg_path: Optional[str] = None,
@@ -1243,6 +1693,10 @@ def generate_vtt_dubbing(
         raise VTTDubbingError("Số worker threads phải nằm trong khoảng 1 đến 8.")
     if max_speedup < 1.0 or max_speedup > 3.0:
         raise VTTDubbingError("Max speedup phải nằm trong khoảng 1.0 đến 3.0.")
+    if overlap_safety_margin_ms < 0:
+        raise VTTDubbingError("Overlap safety margin phải lớn hơn hoặc bằng 0 ms.")
+    if max_shift_ms is not None and max_shift_ms < 0:
+        raise VTTDubbingError("Max shift phải lớn hơn hoặc bằng 0 ms nếu được cấu hình.")
 
     subtitle_mode = validate_subtitle_export_mode(subtitle_export_mode)
     validated_video_input = validate_video_path(str(video_input_path) if video_input_path else None)
@@ -1265,6 +1719,11 @@ def generate_vtt_dubbing(
         f"max_speedup={max_speedup:.2f}, subtitle_export_mode={subtitle_mode}"
     )
     logger.info(f"Worker threads={worker_count}")
+    logger.info(
+        f"Auto avoid overlap={auto_avoid_overlap}, "
+        f"overlap_safety_margin_ms={overlap_safety_margin_ms:.1f}, "
+        f"max_shift_ms={'unlimited' if max_shift_ms is None else f'{max_shift_ms:.1f}'}"
+    )
     if unknown_summary:
         logger.warning(
             "Phát hiện cue không match speaker format và bị gán 'Unknown'. "
@@ -1335,13 +1794,24 @@ def generate_vtt_dubbing(
             emit_status()
 
     ordered_results = [rendered_results[index] for index in sorted(rendered_results)]
+    ordered_results = apply_auto_overlap_avoidance(
+        ordered_results,
+        auto_avoid_overlap=auto_avoid_overlap,
+        overlap_safety_margin_ms=overlap_safety_margin_ms,
+        max_shift_ms=max_shift_ms,
+        logger=logger,
+    )
     final_output_path = Path(output_path) if output_path else build_vtt_output_path(vtt_path, output_root=output_root)
+    logger.info(f"Bắt đầu ghép timeline cuối cùng cho {len(ordered_results)} cue.")
+    emit_status()
     compose_with_ffmpeg(ordered_results, final_output_path, ffmpeg_binary, logger)
     logger.info(f"Hoàn tất. Final audio: {final_output_path.resolve()}")
 
     if validated_video_input is not None and planned_video_output is not None:
         temp_video_root = output_root / "temp"
         muxed_base_video_path = temp_video_root / f"{final_output_path.stem}__base_mux.mp4"
+        logger.info(f"Bắt đầu mux MP4 cuối cùng từ {validated_video_input.name}.")
+        emit_status()
         mux_dubbed_audio_into_video(
             ffmpeg_path=ffmpeg_binary,
             video_input_path=validated_video_input,

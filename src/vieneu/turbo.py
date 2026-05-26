@@ -21,6 +21,10 @@ class BaseTurboVieNeuTTS(BaseVieneuTTS):
         self.encoder_sess = None
         self._is_onnx_codec = True
 
+    def _speech_token_seconds(self) -> float:
+        # Turbo decoder expands one speech token to roughly 40ms audio.
+        return 0.04
+
     def _get_onnx_providers(self, device: str) -> list:
         if device == "cuda":
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -174,21 +178,27 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
             self.backbone.eval()
             logger.info(f"✅ Turbo GPU (Standard) ready")
 
-    def _run_standard_generate(self, prompt: str, temperature: float, top_k: int) -> str:
+    def _run_standard_generate(self, prompt: str, temperature: float, top_k: int, max_new_tokens: int, repetition_penalty: float = 1.1) -> str:
         import torch
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
             output_tokens = self.backbone.generate(
-                **inputs, max_new_tokens=2048, temperature=temperature, top_k=top_k,
-                do_sample=True, repetition_penalty=1.1, top_p=0.95, pad_token_id=self.tokenizer.eos_token_id,
+                **inputs, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k,
+                do_sample=True, repetition_penalty=repetition_penalty, top_p=0.95, pad_token_id=self.tokenizer.eos_token_id,
             )
         new_tokens = output_tokens[0, inputs['input_ids'].shape[-1]:].cpu()
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def infer(self, text: str, voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_chars: int = 256, skip_normalize: bool = False, skip_phonemize: bool = False, show_progress: bool = True, apply_watermark: bool = True, **kwargs) -> np.ndarray:
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True) and not skip_phonemize,
+        )
         phonemes = phonemize_text(text) if not skip_phonemize else text
         chunks = split_into_chunks_v2(phonemes, max_chunk_size=max_chars)
+        self._log_phoneme_preparation(logger, text, phonemes, [chunk.text for chunk in chunks])
 
         if voice is None:
             voice = ref_codes if ref_codes is not None else self.get_preset_voice()
@@ -198,18 +208,72 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
         pbar = tqdm(chunks, desc="🚀 Synthesizing", disable=not (show_progress and len(chunks) > 1), leave=False)
         for i, chunk in enumerate(pbar):
             pbar.set_description(f"  🔊 Chunk {i+1}/{len(chunks)}")
+            silence_dur = get_silence_duration_v2(chunk) if i < len(chunks) - 1 else 0.0
+            guard = self._build_generation_guard(
+                chunk.text,
+                chunk.text,
+                target_duration_s=kwargs.get("target_duration"),
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            sampling = self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.1 if self.backend == "standard" else self.gen_config.repetition_penalty,
+            )
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(chunks),
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                extra={
+                    "sentence_end": chunk.is_sentence_end,
+                    "silence_s": f"{silence_dur:.2f}",
+                    "guard_max_tokens": guard["max_new_tokens"],
+                    "guard_short_text": guard["short_text"],
+                    "guard_compact": guard["repetitive_compact"],
+                    "guard_max_sec": guard["desired_max_duration_s"],
+                    "guard_temp": sampling["temperature"],
+                    "guard_top_k": sampling["top_k"],
+                },
+            )
             prompt = self._format_turbo_prompt(chunk.text)
             if self.backend == "lmdeploy":
-                self.gen_config.temperature, self.gen_config.top_k = temperature, top_k
+                self.gen_config.temperature, self.gen_config.top_k = sampling["temperature"], sampling["top_k"]
+                self.gen_config.max_new_tokens = guard["max_new_tokens"]
+                self.gen_config.min_new_tokens = guard["min_new_tokens"]
+                self.gen_config.repetition_penalty = sampling["repetition_penalty"]
                 responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
                 generated_text = responses[0].text
             else:
-                generated_text = self._run_standard_generate(prompt, temperature, top_k)
+                generated_text = self._run_standard_generate(
+                    prompt,
+                    sampling["temperature"],
+                    sampling["top_k"],
+                    guard["max_new_tokens"],
+                    repetition_penalty=sampling["repetition_penalty"],
+                )
+            generated_text = self._apply_generation_guard(
+                logger,
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                output_str=generated_text,
+                guard=guard,
+            )
             
             wav = self._decode(generated_text, voice_embedding)
+            self._log_generation_result(
+                logger,
+                chunk_index=i,
+                total_chunks=len(chunks),
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                output_str=generated_text,
+                wav=wav,
+            )
             all_wavs.append(wav)
             if i < len(chunks) - 1:
-                silence_dur = get_silence_duration_v2(chunk)
                 if silence_dur > 0:
                     all_wavs.append(np.zeros(int(self.sample_rate * silence_dur), dtype=np.float32))
 
@@ -219,21 +283,89 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
         return final_wav
 
     def infer_batch(self, texts: List[str], voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_batch_size: int = 4, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
+        texts = self._prepare_texts_for_inference(
+            logger,
+            texts,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
         if voice is None:
             voice = ref_codes if ref_codes is not None else self.get_preset_voice()
         voice_embedding = self._get_voice_params(voice)
         chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+        guards = [
+            self._build_generation_guard(
+                text,
+                phonemes,
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            for text, phonemes in zip(texts, chunk_phonemes)
+        ]
+        samplings = [
+            self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.1 if self.backend == "standard" else self.gen_config.repetition_penalty,
+            )
+            for guard in guards
+        ]
+        for i, (text, phonemes) in enumerate(zip(texts, chunk_phonemes)):
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(texts),
+                chunk_text=text,
+                chunk_phonemes=phonemes,
+                extra={
+                    "guard_max_tokens": guards[i]["max_new_tokens"],
+                    "guard_short_text": guards[i]["short_text"],
+                    "guard_compact": guards[i]["repetitive_compact"],
+                    "guard_max_sec": guards[i]["desired_max_duration_s"],
+                    "guard_temp": samplings[i]["temperature"],
+                    "guard_top_k": samplings[i]["top_k"],
+                },
+            )
         
         all_wavs = []
         for i in range(0, len(texts), max_batch_size):
             batch_ph = chunk_phonemes[i : i + max_batch_size]
             if self.backend == "lmdeploy":
                 prompts = [self._format_turbo_prompt(ph) for ph in batch_ph]
-                self.gen_config.temperature, self.gen_config.top_k = temperature, top_k
+                batch_samplings = samplings[i : i + max_batch_size]
+                self.gen_config.temperature = min(sampling["temperature"] for sampling in batch_samplings)
+                self.gen_config.top_k = min(sampling["top_k"] for sampling in batch_samplings)
+                batch_guards = guards[i : i + max_batch_size]
+                self.gen_config.max_new_tokens = max(guard["max_new_tokens"] for guard in batch_guards)
+                self.gen_config.min_new_tokens = min(guard["min_new_tokens"] for guard in batch_guards)
+                self.gen_config.repetition_penalty = max(sampling["repetition_penalty"] for sampling in batch_samplings)
                 responses = self.backbone(prompts, gen_config=self.gen_config, do_preprocess=False)
-                batch_wavs = [self._decode(r.text, voice_embedding) for r in responses]
+                batch_outputs = [r.text for r in responses]
+                guarded_outputs = [
+                    self._apply_generation_guard(
+                        logger,
+                        chunk_text=texts[i + offset],
+                        chunk_phonemes=ph,
+                        output_str=output,
+                        guard=guards[i + offset],
+                    )
+                    for offset, (ph, output) in enumerate(zip(batch_ph, batch_outputs))
+                ]
+                batch_wavs = [self._decode(output, voice_embedding) for output in guarded_outputs]
             else:
+                batch_outputs = None
+                guarded_outputs = None
                 batch_wavs = [self.infer(t, voice=voice, ref_codes=ref_codes, temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=False, **kwargs) for t in texts[i : i + max_batch_size]]
+            if guarded_outputs is not None:
+                for offset, (text, phonemes, output, wav) in enumerate(zip(texts[i : i + max_batch_size], batch_ph, guarded_outputs, batch_wavs)):
+                    self._log_generation_result(
+                        logger,
+                        chunk_index=i + offset,
+                        total_chunks=len(texts),
+                        chunk_text=text,
+                        chunk_phonemes=phonemes,
+                        output_str=output,
+                        wav=wav,
+                    )
             
             if apply_watermark:
                 batch_wavs = [self._apply_watermark(w) for w in batch_wavs]
@@ -241,6 +373,11 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
         return all_wavs
 
     def infer_stream(self, text: str, voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_chars: int = 256, **kwargs) -> Generator[np.ndarray, None, None]:
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
         phonemes = phonemize_text(text)
         chunks = split_into_chunks_v2(phonemes, max_chunk_size=max_chars)
 
@@ -249,13 +386,27 @@ class TurboGPUVieNeuTTS(BaseTurboVieNeuTTS):
         voice_embedding = self._get_voice_params(voice)
 
         for i, chunk in enumerate(chunks):
+            guard = self._build_generation_guard(
+                chunk.text,
+                chunk.text,
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
             prompt = self._format_turbo_prompt(chunk.text)
             if self.backend == "lmdeploy":
                 self.gen_config.temperature, self.gen_config.top_k = temperature, top_k
+                self.gen_config.max_new_tokens = guard["max_new_tokens"]
+                self.gen_config.min_new_tokens = guard["min_new_tokens"]
                 responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
                 generated_text = responses[0].text
             else:
-                generated_text = self._run_standard_generate(prompt, temperature, top_k)
+                generated_text = self._run_standard_generate(prompt, temperature, top_k, guard["max_new_tokens"])
+            generated_text = self._apply_generation_guard(
+                logger,
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                output_str=generated_text,
+                guard=guard,
+            )
             
             yield self._apply_watermark(self._decode(generated_text, voice_embedding))
             if i < len(chunks) - 1:
@@ -309,8 +460,14 @@ class TurboVieNeuTTS(BaseTurboVieNeuTTS):
         logger.info(f"✅ Turbo GGUF ready")
 
     def infer(self, text: str, voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_chars: int = 256, skip_normalize: bool = False, skip_phonemize: bool = False, show_progress: bool = True, apply_watermark: bool = True, **kwargs) -> np.ndarray:
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True) and not skip_phonemize,
+        )
         phonemes = phonemize_text(text) if not skip_phonemize else text
         chunks = split_into_chunks_v2(phonemes, max_chunk_size=max_chars)
+        self._log_phoneme_preparation(logger, text, phonemes, [chunk.text for chunk in chunks])
 
         if voice is None:
             voice = ref_codes if ref_codes is not None else self.get_preset_voice()
@@ -320,15 +477,62 @@ class TurboVieNeuTTS(BaseTurboVieNeuTTS):
         pbar = tqdm(chunks, desc="🚀 Synthesizing", disable=not (show_progress and len(chunks) > 1), leave=False)
         for i, chunk in enumerate(pbar):
             pbar.set_description(f"  🔊 Chunk {i+1}/{len(chunks)}")
+            silence_dur = get_silence_duration_v2(chunk) if i < len(chunks) - 1 else 0.0
+            guard = self._build_generation_guard(
+                chunk.text,
+                chunk.text,
+                target_duration_s=kwargs.get("target_duration"),
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            sampling = self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.15,
+            )
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(chunks),
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                extra={
+                    "sentence_end": chunk.is_sentence_end,
+                    "silence_s": f"{silence_dur:.2f}",
+                    "guard_max_tokens": guard["max_new_tokens"],
+                    "guard_short_text": guard["short_text"],
+                    "guard_compact": guard["repetitive_compact"],
+                    "guard_max_sec": guard["desired_max_duration_s"],
+                    "guard_temp": sampling["temperature"],
+                    "guard_top_k": sampling["top_k"],
+                },
+            )
             self.backbone.reset()
             result = self.backbone(
-                self._format_turbo_prompt(chunk.text), max_tokens=kwargs.get("max_tokens", 2048),
-                temperature=temperature, top_k=top_k, top_p=0.95, min_p=0.05,
-                stop=["<|SPEECH_GENERATION_END|>"], repeat_penalty=1.15, echo=False,
+                self._format_turbo_prompt(chunk.text), max_tokens=guard["max_new_tokens"],
+                temperature=sampling["temperature"], top_k=sampling["top_k"], top_p=0.95, min_p=0.05,
+                stop=["<|SPEECH_GENERATION_END|>"], repeat_penalty=sampling["repetition_penalty"], echo=False,
             )
-            all_wavs.append(self._decode(result["choices"][0]["text"], voice_embedding))
+            generated_text = result["choices"][0]["text"]
+            generated_text = self._apply_generation_guard(
+                logger,
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                output_str=generated_text,
+                guard=guard,
+            )
+            wav = self._decode(generated_text, voice_embedding)
+            self._log_generation_result(
+                logger,
+                chunk_index=i,
+                total_chunks=len(chunks),
+                chunk_text=chunk.text,
+                chunk_phonemes=chunk.text,
+                output_str=generated_text,
+                wav=wav,
+            )
+            all_wavs.append(wav)
             if i < len(chunks) - 1:
-                silence_dur = get_silence_duration_v2(chunk)
                 if silence_dur > 0:
                     all_wavs.append(np.zeros(int(self.sample_rate * silence_dur), dtype=np.float32))
 
@@ -338,6 +542,11 @@ class TurboVieNeuTTS(BaseTurboVieNeuTTS):
         return final_wav
 
     def infer_stream(self, text: str, voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_chars: int = 256, **kwargs) -> Generator[np.ndarray, None, None]:
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
         phonemes = phonemize_text(text)
         chunks = split_into_chunks_v2(phonemes, max_chunk_size=max_chars)
 
@@ -359,9 +568,48 @@ class TurboVieNeuTTS(BaseTurboVieNeuTTS):
                     yield np.zeros(int(self.sample_rate * silence_dur), dtype=np.float32)
 
     def infer_batch(self, texts: List[str], voice: Optional[Any] = None, ref_codes: Optional[Any] = None, temperature: float = 0.4, top_k: int = 50, max_batch_size: int = 4, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
+        texts = self._prepare_texts_for_inference(
+            logger,
+            texts,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
         if voice is None:
             voice = ref_codes if ref_codes is not None else self.get_preset_voice()
         voice_embedding = self._get_voice_params(voice)
+        chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+        guards = [
+            self._build_generation_guard(
+                text,
+                phonemes,
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            for text, phonemes in zip(texts, chunk_phonemes)
+        ]
+        samplings = [
+            self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=1.15,
+            )
+            for guard in guards
+        ]
+        for i, (text, phonemes) in enumerate(zip(texts, chunk_phonemes)):
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=i,
+                total_chunks=len(texts),
+                chunk_text=text,
+                chunk_phonemes=phonemes,
+                extra={
+                    "guard_max_tokens": guards[i]["max_new_tokens"],
+                    "guard_short_text": guards[i]["short_text"],
+                    "guard_compact": guards[i]["repetitive_compact"],
+                    "guard_max_sec": guards[i]["desired_max_duration_s"],
+                    "guard_temp": samplings[i]["temperature"],
+                    "guard_top_k": samplings[i]["top_k"],
+                },
+            )
         all_wavs = []
         for i in range(0, len(texts), max_batch_size):
             batch_texts = texts[i : i + max_batch_size]

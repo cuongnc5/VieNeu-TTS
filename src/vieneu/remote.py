@@ -52,27 +52,66 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
     def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        original_text = text
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)
 
         chunks = split_text_into_chunks(text, max_chars=max_chars)
+        self._log_text_preparation(logger, original_text, text, chunks)
         if not chunks:
             return np.array([], dtype=np.float32)
 
         if len(chunks) == 1:
+            ref_phonemes = self.get_ref_phonemes(ref_text)
+            self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
+            chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
+            guard = self._build_generation_guard(
+                chunks[0],
+                chunk_phonemes[0],
+                target_duration_s=kwargs.get("target_duration"),
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            sampling = self._build_sampling_controls(
+                temperature=temperature,
+                top_k=top_k,
+                guard=guard,
+                repetition_penalty=repetition_penalty,
+            )
+            self._log_chunk_inputs(
+                logger,
+                chunk_index=0,
+                total_chunks=1,
+                chunk_text=chunks[0],
+                chunk_phonemes=chunk_phonemes[0],
+                extra={
+                    "guard_max_tokens": guard["max_new_tokens"],
+                    "guard_short_text": guard["short_text"],
+                    "guard_compact": guard["repetitive_compact"],
+                    "guard_max_sec": guard["desired_max_duration_s"],
+                    "guard_temp": sampling["temperature"],
+                    "guard_top_k": sampling["top_k"],
+                },
+            )
             prompt = self._format_prompt(
                 ref_codes, ref_text, chunks[0],
+                ref_phonemes=ref_phonemes,
+                input_phonemes=chunk_phonemes[0],
                 use_chat_format=self.use_chat_format,
                 emotion_tag=kwargs.get('emotion_tag', self.default_emotion)
             )
             payload = {
                 "model": self.model_name,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 2048,
-                "temperature": temperature,
-                "top_k": top_k,
-                "repetition_penalty": repetition_penalty,
+                "max_tokens": guard["max_new_tokens"],
+                "temperature": sampling["temperature"],
+                "top_k": sampling["top_k"],
+                "repetition_penalty": sampling["repetition_penalty"],
                 "stop": ["<|SPEECH_GENERATION_END|>"],
                 "stream": False
             }
@@ -80,7 +119,23 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
                 response = requests.post(f"{self.api_base}/chat/completions", json=payload, timeout=60)
                 response.raise_for_status()
                 output_str = response.json()["choices"][0]["message"]["content"]
+                output_str = self._apply_generation_guard(
+                    logger,
+                    chunk_text=chunks[0],
+                    chunk_phonemes=chunk_phonemes[0],
+                    output_str=output_str,
+                    guard=guard,
+                )
                 wav = self._decode(output_str)
+                self._log_generation_result(
+                    logger,
+                    chunk_index=0,
+                    total_chunks=1,
+                    chunk_text=chunks[0],
+                    chunk_phonemes=chunk_phonemes[0],
+                    output_str=output_str,
+                    wav=wav,
+                )
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
                 return wav
@@ -93,13 +148,18 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             text, ref_codes=ref_codes, ref_text=ref_text,
             max_chars=max_chars, silence_p=silence_p, crossfade_p=crossfade_p,
             temperature=temperature, top_k=top_k, repetition_penalty=repetition_penalty,
-            skip_normalize=True, apply_watermark=True,
+            skip_normalize=True, apply_watermark=apply_watermark,
             **kwargs
         ))
 
     def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)
@@ -186,6 +246,11 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             raise ImportError("Async requires 'aiohttp'.")
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
+        text, _ = self._prepare_text_for_inference(
+            logger,
+            text,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
 
         if not skip_normalize:
             text = self.normalizer.normalize(text)
@@ -200,7 +265,32 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             should_close_session = True
 
         try:
-            tasks = [self._infer_chunk_async(session, chunk, ref_codes, ref_text, temperature, top_k, repetition_penalty, **kwargs) for chunk in chunks]
+            ref_phonemes = self.get_ref_phonemes(ref_text)
+            self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
+            chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
+            tasks = [
+                self._infer_chunk_async(
+                    session,
+                    chunk,
+                    ref_codes,
+                    ref_text,
+                    temperature,
+                    top_k,
+                    repetition_penalty,
+                    ref_phonemes=ref_phonemes,
+                    chunk_phonemes=chunk_phoneme,
+                    guard=self._build_generation_guard(
+                        chunk,
+                        chunk_phoneme,
+                        target_duration_s=kwargs.get("target_duration"),
+                        requested_max_new_tokens=kwargs.get("max_new_tokens"),
+                    ),
+                    chunk_index=i,
+                    total_chunks=len(chunks),
+                    **kwargs,
+                )
+                for i, (chunk, chunk_phoneme) in enumerate(zip(chunks, chunk_phonemes))
+            ]
             wavs = await asyncio.gather(*tasks)
             final_wav = join_audio_chunks(wavs, self.sample_rate, silence_p, crossfade_p)
             if apply_watermark:
@@ -229,9 +319,41 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
         repetition_penalty: float,
         ref_phonemes: Optional[str] = None,
         chunk_phonemes: Optional[str] = None,
+        guard: Optional[Dict[str, Any]] = None,
+        chunk_index: int = 0,
+        total_chunks: int = 1,
         **kwargs
     ) -> np.ndarray:
         """Internal helper for asynchronous chunk inference."""
+        if chunk_phonemes is None:
+            chunk_phonemes = phonemize_with_dict(chunk, skip_normalize=True)
+        guard = guard or self._build_generation_guard(
+            chunk,
+            chunk_phonemes,
+            target_duration_s=kwargs.get("target_duration"),
+            requested_max_new_tokens=kwargs.get("max_new_tokens"),
+        )
+        sampling = self._build_sampling_controls(
+            temperature=temperature,
+            top_k=top_k,
+            guard=guard,
+            repetition_penalty=repetition_penalty,
+        )
+        self._log_chunk_inputs(
+            logger,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+            chunk_text=chunk,
+            chunk_phonemes=chunk_phonemes,
+            extra={
+                "guard_max_tokens": guard["max_new_tokens"],
+                "guard_short_text": guard["short_text"],
+                "guard_compact": guard["repetitive_compact"],
+                "guard_max_sec": guard["desired_max_duration_s"],
+                "guard_temp": sampling["temperature"],
+                "guard_top_k": sampling["top_k"],
+            },
+        )
         prompt = self._format_prompt(
             ref_codes, ref_text, chunk, 
             ref_phonemes=ref_phonemes, 
@@ -242,10 +364,10 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048,
-            "temperature": temperature,
-            "top_k": top_k,
-            "repetition_penalty": repetition_penalty,
+            "max_tokens": guard["max_new_tokens"],
+            "temperature": sampling["temperature"],
+            "top_k": sampling["top_k"],
+            "repetition_penalty": sampling["repetition_penalty"],
             "stop": ["<|SPEECH_GENERATION_END|>"],
             "stream": False
         }
@@ -254,7 +376,24 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
                 resp.raise_for_status()
                 data = await resp.json()
                 output_str = data["choices"][0]["message"]["content"]
-                return self._decode(output_str)
+                output_str = self._apply_generation_guard(
+                    logger,
+                    chunk_text=chunk,
+                    chunk_phonemes=chunk_phonemes,
+                    output_str=output_str,
+                    guard=guard,
+                )
+                wav = self._decode(output_str)
+                self._log_generation_result(
+                    logger,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    chunk_text=chunk,
+                    chunk_phonemes=chunk_phonemes,
+                    output_str=output_str,
+                    wav=wav,
+                )
+                return wav
         except Exception as e:
             logger.error(f"Error in async chunk: {e}")
             return np.array([], dtype=np.float32)
@@ -265,6 +404,12 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
         except ImportError:
             raise ImportError("Async requires 'aiohttp'.")
 
+        texts = self._prepare_texts_for_inference(
+            logger,
+            texts,
+            rewrite_enabled=kwargs.get("rewrite_problematic_short_text", True),
+        )
+
         if not skip_normalize:
             texts = [self.normalizer.normalize(t) for t in texts]
 
@@ -272,31 +417,74 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
 
         # Pre-phonemize all for performance
         ref_phonemes = self.get_ref_phonemes(ref_text)
+        self._log_reference_context(logger, ref_text, ref_phonemes, ref_codes)
         all_phonemes = phonemize_batch(texts, skip_normalize=True)
+        guards = [
+            self._build_generation_guard(
+                text,
+                phonemes,
+                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+            )
+            for text, phonemes in zip(texts, all_phonemes)
+        ]
 
         sem = asyncio.Semaphore(concurrency_limit)
         async with aiohttp.ClientSession() as session:
-            async def bounded_infer(text, ph):
+            async def bounded_infer(text, ph, guard):
                 async with sem:
                     # Split into chunks internally if needed
                     chunks = split_text_into_chunks(text, max_chars=max_chars)
                     if not chunks: return np.array([], dtype=np.float32)
 
                     if len(chunks) == 1:
-                        wav = await self._infer_chunk_async(session, chunks[0], ref_codes, ref_text, temperature, top_k, repetition_penalty, ref_phonemes=ref_phonemes, chunk_phonemes=ph, **kwargs)
+                        wav = await self._infer_chunk_async(
+                            session,
+                            chunks[0],
+                            ref_codes,
+                            ref_text,
+                            temperature,
+                            top_k,
+                            repetition_penalty,
+                            ref_phonemes=ref_phonemes,
+                            chunk_phonemes=ph,
+                            guard=guard,
+                            chunk_index=0,
+                            total_chunks=1,
+                            **kwargs,
+                        )
                         if apply_watermark: wav = self._apply_watermark(wav)
                         return wav
 
                     # Re-phonemize chunks if splitting happened
                     chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
-                    tasks = [self._infer_chunk_async(session, c, ref_codes, ref_text, temperature, top_k, repetition_penalty, ref_phonemes=ref_phonemes, chunk_phonemes=c_ph, **kwargs)
-                            for c, c_ph in zip(chunks, chunk_phonemes)]
+                    tasks = [
+                        self._infer_chunk_async(
+                            session,
+                            c,
+                            ref_codes,
+                            ref_text,
+                            temperature,
+                            top_k,
+                            repetition_penalty,
+                            ref_phonemes=ref_phonemes,
+                            chunk_phonemes=c_ph,
+                            guard=self._build_generation_guard(
+                                c,
+                                c_ph,
+                                requested_max_new_tokens=kwargs.get("max_new_tokens"),
+                            ),
+                            chunk_index=i,
+                            total_chunks=len(chunks),
+                            **kwargs,
+                        )
+                        for i, (c, c_ph) in enumerate(zip(chunks, chunk_phonemes))
+                    ]
                     wavs = await asyncio.gather(*tasks)
                     final_wav = join_audio_chunks(wavs, self.sample_rate, silence_p, crossfade_p)
                     if apply_watermark: final_wav = self._apply_watermark(final_wav)
                     return final_wav
 
-            tasks = [bounded_infer(text, ph) for text, ph in zip(texts, all_phonemes)]
+            tasks = [bounded_infer(text, ph, guard) for text, ph, guard in zip(texts, all_phonemes, guards)]
             results = await asyncio.gather(*tasks)
 
         return results
